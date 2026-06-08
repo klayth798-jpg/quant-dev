@@ -1,0 +1,42 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      QUANTDEV_ENV: production
+      QUANTDEV_DATABASE_PATH: /app/data/quantdev.db
+    volumes:
+      - quantdev-data:/app/data
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["platform"]
+    environment:
+      POSTGRES_DB: quantdev
+      POSTGRES_USER: quantdev
+      POSTGRES_PASSWORD: change-me
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["platform"]
+
+  minio:
+    image: minio/minio:latest
+    profiles: ["platform"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: quantdev
+      MINIO_ROOT_PASSWORD: change-me-now
+    volumes:
+      - minio-data:/data
+
+volumes:
+  quantdev-data:
+  postgres-data:
+  minio-data:
+

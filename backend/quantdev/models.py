@@ -1,0 +1,62 @@
+from datetime import date
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class FactorEvaluateRequest(BaseModel):
+    forward_days: int = Field(default=5, ge=1, le=60)
+
+
+class BacktestRequest(BaseModel):
+    name: str = Field(default="多因子选股回测", min_length=1, max_length=80)
+    factor_id: str = "momentum_20"
+    initial_capital: float = Field(default=1_000_000, gt=10_000)
+    top_n: int = Field(default=3, ge=1, le=20)
+    rebalance_days: int = Field(default=5, ge=1, le=60)
+    commission_rate: float = Field(default=0.0003, ge=0, le=0.01)
+    stamp_duty_rate: float = Field(default=0.0005, ge=0, le=0.01)
+    slippage_bps: float = Field(default=5, ge=0, le=100)
+
+
+class PositionInput(BaseModel):
+    symbol: str
+    weight: float = Field(ge=0, le=1)
+
+
+class RiskCheckRequest(BaseModel):
+    positions: List[PositionInput]
+    proposed_turnover: float = Field(default=0, ge=0)
+    current_drawdown: float = Field(default=0, ge=0)
+    order_notional_weight: float = Field(default=0, ge=0)
+
+
+class AgentResearchRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=1000)
+    factor_id: Optional[str] = None
+    backtest_run_id: Optional[str] = None
+
+
+class PaperOrderRequest(BaseModel):
+    client_order_id: str = Field(min_length=8, max_length=80)
+    symbol: str = Field(min_length=6, max_length=20)
+    side: str
+    quantity: int = Field(gt=0)
+    order_type: str = "market"
+    limit_price: Optional[float] = Field(default=None, gt=0)
+
+
+class TushareSyncRequest(BaseModel):
+    start_date: date
+    end_date: date
+    sync_daily: bool = True
+    sync_financials: bool = True
+    sync_indices: bool = True
+    indices: Optional[List[str]] = None
+    financial_symbols: Optional[List[str]] = None
+    max_standard_financial_symbols: int = Field(default=100, ge=1, le=1000)
+
+
+class ApiMessage(BaseModel):
+    message: str
+    data: Dict[str, Any] = {}

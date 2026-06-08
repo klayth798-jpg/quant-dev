@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Quant Dev</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">QD</span>
+          <div>
+            <strong>Quant Dev</strong>
+            <small>Research Console</small>
+          </div>
+        </div>
+        <nav aria-label="主导航">
+          <button class="nav-item is-active" data-view="overview">
+            <span class="nav-glyph">01</span><span>总览</span>
+          </button>
+          <button class="nav-item" data-view="data">
+            <span class="nav-glyph">02</span><span>数据中心</span>
+          </button>
+          <button class="nav-item" data-view="factors">
+            <span class="nav-glyph">03</span><span>因子实验室</span>
+          </button>
+          <button class="nav-item" data-view="backtest">
+            <span class="nav-glyph">04</span><span>策略回测</span>
+          </button>
+          <button class="nav-item" data-view="risk">
+            <span class="nav-glyph">05</span><span>风险检查</span>
+          </button>
+          <button class="nav-item" data-view="paper">
+            <span class="nav-glyph">06</span><span>模拟交易</span>
+          </button>
+          <button class="nav-item" data-view="agent">
+            <span class="nav-glyph">07</span><span>研究 Agent</span>
+          </button>
+        </nav>
+        <div class="sidebar-status">
+          <span class="status-dot"></span>
+          <div>
+            <strong>研究环境</strong>
+            <small>实盘权限已关闭</small>
+          </div>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="page-eyebrow">WORKSPACE / OVERVIEW</p>
+            <h1 id="page-title">量化研究总览</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="snapshot" id="snapshot-label">加载数据快照...</span>
+            <button class="button secondary" id="refresh-button">刷新</button>
+          </div>
+        </header>
+        <div id="toast" class="toast" role="status" aria-live="polite"></div>
+        <section id="workspace" class="workspace" aria-live="polite">
+          <div class="loading-block">正在初始化研究环境...</div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
