@@ -1,7 +1,8 @@
 from typing import Any, Dict
 
 from quantdev.db import database
-from quantdev.models import PaperOrderRequest
+from quantdev.models import PaperOrderRequest, PositionInput, RiskCheckRequest
+from quantdev.services.risk import risk_service
 from quantdev.store import new_id, store, utc_now
 
 
@@ -11,7 +12,6 @@ class PaperExecutionService:
     stamp_duty_rate = 0.0005
     slippage_bps = 5.0
     lot_size = 100
-    max_order_weight = 0.20
 
     def ensure_account(self) -> None:
         with database.transaction() as connection:
@@ -115,12 +115,29 @@ class PaperExecutionService:
 
         now = utc_now()
         order_id = new_id("ord")
+        risk_request = None
+        risk_result = None
         with database.transaction() as connection:
             existing = connection.execute(
                 "SELECT * FROM paper_orders WHERE client_order_id = ?",
                 (request.client_order_id,),
             ).fetchone()
             if existing:
+                same_request = (
+                    existing["symbol"] == request.symbol
+                    and existing["side"] == side
+                    and existing["quantity"] == request.quantity
+                    and existing["order_type"] == order_type
+                    and (
+                        existing["limit_price"] == request.limit_price
+                        or (
+                            existing["limit_price"] is None
+                            and request.limit_price is None
+                        )
+                    )
+                )
+                if not same_request:
+                    raise ValueError("client_order_id 已被其他委托使用")
                 return {
                     "idempotent": True,
                     "order": dict(existing),
@@ -133,19 +150,22 @@ class PaperExecutionService:
             if request.symbol not in prices:
                 raise ValueError("标的没有可用行情")
             market_price = prices[request.symbol]
+            direction = 1 if side == "buy" else -1
+            simulated_market_price = market_price * (
+                1 + direction * self.slippage_bps / 10_000
+            )
+            marketable = True
             if order_type == "limit":
-                if side == "buy" and request.limit_price < market_price:
-                    fill_price = request.limit_price
-                elif side == "sell" and request.limit_price > market_price:
-                    fill_price = request.limit_price
+                if side == "buy":
+                    marketable = request.limit_price >= market_price
+                    fill_price = min(request.limit_price, simulated_market_price)
                 else:
-                    fill_price = request.limit_price
+                    marketable = request.limit_price <= market_price
+                    fill_price = max(request.limit_price, simulated_market_price)
             else:
-                direction = 1 if side == "buy" else -1
-                fill_price = market_price * (
-                    1 + direction * self.slippage_bps / 10_000
-                )
-            gross = request.quantity * fill_price
+                fill_price = simulated_market_price
+            notional_price = fill_price if marketable else request.limit_price
+            gross = request.quantity * notional_price
             positions = connection.execute(
                 "SELECT * FROM paper_positions WHERE account_id = ?",
                 (self.account_id,),
@@ -156,8 +176,6 @@ class PaperExecutionService:
             )
             equity = float(account["cash"]) + market_value
             reject_reason = None
-            if equity and gross / equity > self.max_order_weight:
-                reject_reason = "单笔委托超过账户净值的 20%"
 
             commission = max(5.0, gross * self.commission_rate)
             stamp_duty = gross * self.stamp_duty_rate if side == "sell" else 0.0
@@ -175,8 +193,52 @@ class PaperExecutionService:
                 not current_position or current_position["quantity"] < request.quantity
             ):
                 reject_reason = "可卖持仓不足"
+            if side == "buy" and not reject_reason and equity > 0:
+                projected_quantities = {
+                    row["symbol"]: int(row["quantity"]) for row in positions
+                }
+                projected_quantities[request.symbol] = (
+                    projected_quantities.get(request.symbol, 0) + request.quantity
+                )
+                projected_weights = []
+                for symbol, quantity in projected_quantities.items():
+                    if quantity <= 0:
+                        continue
+                    valuation_price = (
+                        notional_price
+                        if symbol == request.symbol
+                        else prices.get(symbol)
+                    )
+                    if valuation_price is None:
+                        continue
+                    projected_weights.append(
+                        PositionInput(
+                            symbol=symbol,
+                            weight=quantity * valuation_price / equity,
+                        )
+                    )
+                risk_request = RiskCheckRequest(
+                    positions=projected_weights,
+                    proposed_turnover=gross / equity,
+                    current_drawdown=max(
+                        0.0,
+                        1 - equity / float(account["initial_cash"]),
+                    ),
+                    order_notional_weight=gross / equity,
+                )
+                risk_result = risk_service.evaluate(risk_request)
+                if not risk_result["approved"]:
+                    reject_reason = "；".join(
+                        breach["message"] for breach in risk_result["breaches"]
+                    )
 
-            status = "REJECTED" if reject_reason else "FILLED"
+            status = (
+                "REJECTED"
+                if reject_reason
+                else "FILLED"
+                if marketable
+                else "OPEN"
+            )
             connection.execute(
                 """
                 INSERT INTO paper_orders
@@ -199,7 +261,7 @@ class PaperExecutionService:
                     now,
                 ),
             )
-            if not reject_reason:
+            if status == "FILLED":
                 if side == "buy":
                     old_quantity = current_position["quantity"] if current_position else 0
                     old_cost = current_position["average_cost"] if current_position else 0.0
@@ -271,6 +333,14 @@ class PaperExecutionService:
                     ),
                 )
 
+        if risk_result and not risk_result["approved"] and risk_request:
+            for breach in risk_result["breaches"]:
+                store.save_risk_event(
+                    breach["severity"],
+                    breach["rule_code"],
+                    breach["message"],
+                    risk_request.model_dump(),
+                )
         store.audit(
             actor="local-user",
             action="submit_paper_order",
@@ -283,8 +353,8 @@ class PaperExecutionService:
             "order_id": order_id,
             "status": status,
             "reject_reason": reject_reason,
-            "fill_price": round(fill_price, 4) if not reject_reason else None,
-            "fees": round(fees, 2) if not reject_reason else None,
+            "fill_price": round(fill_price, 4) if status == "FILLED" else None,
+            "fees": round(fees, 2) if status == "FILLED" else None,
             "account": self.get_account(),
         }
 

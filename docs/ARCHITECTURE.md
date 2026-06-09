@@ -35,9 +35,11 @@ Agent 和 OMS 独立部署。
 - 结果指标
 - 创建时间
 
-真实数据使用稳定快照 `tushare-cn-equity-live-v1` 做增量更新，每次同步的参数、状态、
-写入统计和错误信息记录在 `data_sync_runs`。日线按交易日同步，指数权重按自然月同步，
-避免超过接口单次返回上限并减少重复调用。
+真实数据按 SDK 使用活动数据集 ID `tushare-cn-equity-live-v1` 或
+`tinyshare-cn-equity-live-v1` 做增量更新，每次同步的参数、状态、写入统计和错误信息
+记录在 `data_sync_runs`。日线按交易日同步，指数权重按自然月同步，避免超过接口单次
+返回上限并减少重复调用。活动数据集会随同步变化，生产化前需升级为不可变版本和
+Manifest，才能保证旧回测严格复现。
 
 真实数据阶段将行情与因子矩阵放入 Parquet/对象存储，元数据和交易账本迁移到
 PostgreSQL。研究查询使用 DuckDB/Polars，任务调度使用 Prefect。

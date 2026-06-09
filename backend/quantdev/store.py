@@ -50,6 +50,21 @@ class Store:
             ).fetchone()
         return str(row["snapshot_id"]) if row else None
 
+    def price_summary(self, snapshot_id: str) -> Dict[str, Any]:
+        with database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count,
+                       COUNT(DISTINCT symbol) AS instrument_count,
+                       MIN(trade_date) AS start_date,
+                       MAX(trade_date) AS end_date
+                FROM prices
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchone()
+        return dict(row)
+
     def get_data_sync_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         with database.connect() as connection:
             row = connection.execute(
@@ -113,6 +128,46 @@ class Store:
         with database.connect() as connection:
             rows = connection.execute(query, index_codes).fetchall()
         return [str(row["symbol"]) for row in rows]
+
+    def list_index_constituents(
+        self, index_codes: List[str]
+    ) -> List[Dict[str, Any]]:
+        if not index_codes:
+            return []
+        placeholders = ",".join("?" for _ in index_codes)
+        with database.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT index_code, symbol, trade_date
+                FROM index_constituents
+                WHERE index_code IN ({placeholders})
+                ORDER BY index_code, trade_date, symbol
+                """,
+                index_codes,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def industry_map(self) -> Dict[str, str]:
+        """返回 symbol -> 行业 的映射，用于行业中性化。"""
+        with database.connect() as connection:
+            rows = connection.execute(
+                "SELECT symbol, industry FROM instruments"
+            ).fetchall()
+        return {str(row["symbol"]): str(row["industry"]) for row in rows}
+
+    def market_cap_panel(self) -> Dict[str, Dict[str, float]]:
+        """返回 trade_date -> {symbol: total_mv} 的市值面板，用于市值中性化。"""
+        panel: Dict[str, Dict[str, float]] = {}
+        with database.connect() as connection:
+            rows = connection.execute(
+                "SELECT trade_date, symbol, total_mv FROM daily_indicators "
+                "WHERE total_mv IS NOT NULL AND total_mv > 0"
+            ).fetchall()
+        for row in rows:
+            panel.setdefault(str(row["trade_date"]), {})[str(row["symbol"])] = float(
+                row["total_mv"]
+            )
+        return panel
 
     def list_financial_indicators(
         self, symbol: str, limit: int = 20

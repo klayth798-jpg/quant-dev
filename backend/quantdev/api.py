@@ -38,8 +38,10 @@ def _ensure_demo_results() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.migrate()
-    market_data_service.bootstrap_demo_data()
-    _ensure_demo_results()
+    market_data_service.ensure_factor_definitions()
+    if settings.data_mode == "demo":
+        market_data_service.bootstrap_demo_data()
+        _ensure_demo_results()
     yield
 
 
@@ -63,6 +65,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "environment": settings.environment,
+        "data_mode": settings.data_mode,
         "database": str(settings.database_path),
         "live_trading": "disabled",
         "agent_permissions": "read-only",
@@ -71,18 +74,29 @@ def health() -> Dict[str, Any]:
 
 @app.get("/api/dashboard")
 def dashboard() -> Dict[str, Any]:
-    instruments = store.list_instruments()
     factors = store.list_factors()
     backtests = store.list_backtests(limit=5)
     snapshot_id = store.latest_snapshot_id()
-    prices = store.list_prices(snapshot_id=snapshot_id) if snapshot_id else []
-    dates = sorted({row["trade_date"] for row in prices})
+    price_summary = (
+        store.price_summary(snapshot_id)
+        if snapshot_id
+        else {
+            "row_count": 0,
+            "instrument_count": 0,
+            "start_date": None,
+            "end_date": None,
+        }
+    )
     latest = backtests[0] if backtests else None
     return {
         "snapshot_id": snapshot_id,
-        "instrument_count": len(instruments),
-        "price_row_count": len(prices),
-        "date_range": [dates[0], dates[-1]] if dates else [],
+        "instrument_count": price_summary["instrument_count"],
+        "price_row_count": price_summary["row_count"],
+        "date_range": (
+            [price_summary["start_date"], price_summary["end_date"]]
+            if price_summary["start_date"]
+            else []
+        ),
         "factor_count": len(factors),
         "approved_factor_count": sum(
             1 for factor in factors if factor["status"] == "approved"
@@ -136,9 +150,14 @@ def sync_tushare(
     background_tasks: BackgroundTasks,
 ) -> Dict[str, Any]:
     if not settings.tushare_token:
+        token_name = (
+            "TINYSHARE_TOKEN"
+            if settings.market_data_sdk == "tinyshare"
+            else "TUSHARE_TOKEN"
+        )
         raise HTTPException(
             status_code=409,
-            detail="请在项目根目录 .env 配置 TUSHARE_TOKEN 并重启服务",
+            detail=f"请在项目根目录 .env 配置 {token_name} 并重启服务",
         )
     try:
         run = tushare_sync_service.create_run(request)
@@ -182,7 +201,9 @@ def evaluate_factor(
     factor_id: str, request: FactorEvaluateRequest
 ) -> Dict[str, Any]:
     try:
-        return factor_service.evaluate(factor_id, request.forward_days)
+        return factor_service.evaluate(
+            factor_id, request.forward_days, request.neutralize
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -233,12 +254,22 @@ def agent_research(request: AgentResearchRequest) -> Dict[str, Any]:
 
 @app.get("/api/system/requirements")
 def system_requirements() -> Dict[str, Any]:
+    market_provider = (
+        "Tinyshare 代理接口"
+        if settings.market_data_sdk == "tinyshare"
+        else "Tushare Pro"
+    )
+    market_token_env = (
+        "TINYSHARE_TOKEN"
+        if settings.market_data_sdk == "tinyshare"
+        else "TUSHARE_TOKEN"
+    )
     return {
         "required_now": [],
         "optional_data_apis": [
             {
-                "name": "Tushare Pro",
-                "env": "TUSHARE_TOKEN",
+                "name": market_provider,
+                "env": market_token_env,
                 "purpose": "A股日线、财务数据、交易日历和指数成分",
                 "status": "configured" if settings.tushare_token else "not_configured",
             },

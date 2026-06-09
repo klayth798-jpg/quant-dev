@@ -1,6 +1,7 @@
 import json
 import math
 from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -9,8 +10,6 @@ from quantdev.db import database
 from quantdev.integrations.market_data import TushareAdapter
 from quantdev.models import TushareSyncRequest
 from quantdev.store import new_id, store, utc_now
-
-TUSHARE_SNAPSHOT_ID = "tushare-cn-equity-live-v1"
 
 
 def _api_date(value: date) -> str:
@@ -62,6 +61,33 @@ class TushareSyncService:
     ):
         self.adapter_factory = adapter_factory
 
+    @property
+    def provider(self) -> str:
+        return settings.market_data_sdk
+
+    @property
+    def snapshot_id(self) -> str:
+        return f"{self.provider}-cn-equity-live-v1"
+
+    @staticmethod
+    def _ensure_instruments(connection, symbols: Iterable[str]) -> None:
+        unique_symbols = sorted(set(symbols))
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO instruments
+                (symbol, name, exchange, asset_type, industry, active)
+            VALUES (?, ?, ?, 'stock', '未分类', 1)
+            """,
+            [
+                (
+                    symbol,
+                    symbol,
+                    "SSE" if symbol.endswith(".SH") else "SZSE",
+                )
+                for symbol in unique_symbols
+            ],
+        )
+
     def create_run(self, request: TushareSyncRequest) -> Dict[str, Any]:
         if request.end_date < request.start_date:
             raise ValueError("结束日期不能早于开始日期")
@@ -73,9 +99,14 @@ class TushareSyncService:
                 INSERT INTO data_sync_runs
                     (run_id, provider, dataset, status, parameters_json, stats_json,
                      error_message, started_at, finished_at)
-                VALUES (?, 'tushare', 'cn_equity', 'queued', ?, '{}', NULL, ?, NULL)
+                VALUES (?, ?, 'cn_equity', 'queued', ?, '{}', NULL, ?, NULL)
                 """,
-                (run_id, json.dumps(parameters, ensure_ascii=True), utc_now()),
+                (
+                    run_id,
+                    self.provider,
+                    json.dumps(parameters, ensure_ascii=True),
+                    utc_now(),
+                ),
             )
         return self.get_run(run_id)
 
@@ -93,7 +124,7 @@ class TushareSyncService:
     ) -> Dict[str, Any]:
         self._set_run_state(run_id, "running", {}, None, finished=False)
         stats: Dict[str, Any] = {
-            "snapshot_id": TUSHARE_SNAPSHOT_ID,
+            "snapshot_id": self.snapshot_id,
             "instruments": 0,
             "calendar_days": 0,
             "price_rows": 0,
@@ -127,6 +158,16 @@ class TushareSyncService:
                 resource_id=run_id,
                 payload=stats,
             )
+        except KeyboardInterrupt:
+            stats["failed_at"] = utc_now()
+            self._set_run_state(
+                run_id,
+                "interrupted",
+                stats,
+                "同步任务被手动中断，可重新运行并从已完成日期继续",
+                finished=True,
+            )
+            raise
         except Exception as exc:
             stats["failed_at"] = utc_now()
             self._set_run_state(
@@ -199,7 +240,7 @@ class TushareSyncService:
                     INSERT INTO instrument_metadata
                         (symbol, raw_symbol, area, market, currency, list_status,
                          list_date, delist_date, is_hs, source, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'tushare', ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol) DO UPDATE SET
                         raw_symbol = excluded.raw_symbol,
                         area = excluded.area,
@@ -221,6 +262,7 @@ class TushareSyncService:
                         _iso_date(row.get("list_date")),
                         _iso_date(row.get("delist_date")),
                         row.get("is_hs"),
+                        self.provider,
                         now,
                     ),
                 )
@@ -236,7 +278,7 @@ class TushareSyncService:
                 """
                 INSERT INTO trade_calendar
                     (exchange, cal_date, is_open, pretrade_date, source, updated_at)
-                VALUES (?, ?, ?, ?, 'tushare', ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exchange, cal_date) DO UPDATE SET
                     is_open = excluded.is_open,
                     pretrade_date = excluded.pretrade_date,
@@ -248,6 +290,7 @@ class TushareSyncService:
                         _iso_date(row["cal_date"]),
                         int(row.get("is_open") or 0),
                         _iso_date(row.get("pretrade_date")),
+                        self.provider,
                         now,
                     )
                     for row in rows
@@ -272,16 +315,17 @@ class TushareSyncService:
                 for row in connection.execute(
                     """
                     SELECT DISTINCT trade_date FROM prices
-                    WHERE source = 'tushare' AND snapshot_id = ?
+                    WHERE source = ? AND snapshot_id = ?
                     """,
-                    (TUSHARE_SNAPSHOT_ID,),
+                    (self.provider, self.snapshot_id),
                 ).fetchall()
             }
             existing_indicators = {
                 row["trade_date"].replace("-", "")
                 for row in connection.execute(
                     "SELECT DISTINCT trade_date FROM daily_indicators "
-                    "WHERE source = 'tushare'"
+                    "WHERE source = ?",
+                    (self.provider,),
                 ).fetchall()
             }
 
@@ -291,25 +335,56 @@ class TushareSyncService:
             "skipped_price_dates": 0,
             "skipped_indicator_dates": 0,
         }
+        jobs = []
         for trade_date in sorted(open_dates):
-            if trade_date in existing_prices:
+            needs_prices = trade_date not in existing_prices
+            needs_indicators = trade_date not in existing_indicators
+            if not needs_prices:
                 result["skipped_price_dates"] += 1
-            else:
-                bars = adapter.fetch_daily_bars_by_date(trade_date)
-                factors = {
-                    row["ts_code"]: row.get("adj_factor")
-                    for row in adapter.fetch_adj_factors_by_date(trade_date)
-                }
-                result["price_rows"] += self._save_prices(bars, factors)
-
-            if trade_date in existing_indicators:
+            if not needs_indicators:
                 result["skipped_indicator_dates"] += 1
-            else:
-                indicators = adapter.fetch_daily_indicators_by_date(trade_date)
-                result["daily_indicator_rows"] += self._save_daily_indicators(
-                    indicators, run_id
-                )
+            if needs_prices or needs_indicators:
+                jobs.append((trade_date, needs_prices, needs_indicators))
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            bundles = executor.map(
+                lambda job: self._fetch_daily_bundle(adapter, *job),
+                jobs,
+            )
+            for bundle in bundles:
+                if bundle["needs_prices"]:
+                    result["price_rows"] += self._save_prices(
+                        bundle["bars"],
+                        bundle["factors"],
+                    )
+                if bundle["needs_indicators"]:
+                    result["daily_indicator_rows"] += self._save_daily_indicators(
+                        bundle["indicators"],
+                        run_id,
+                    )
         return result
+
+    @staticmethod
+    def _fetch_daily_bundle(
+        adapter: TushareAdapter,
+        trade_date: str,
+        needs_prices: bool,
+        needs_indicators: bool,
+    ) -> Dict[str, Any]:
+        bundle: Dict[str, Any] = {
+            "trade_date": trade_date,
+            "needs_prices": needs_prices,
+            "needs_indicators": needs_indicators,
+        }
+        if needs_prices:
+            bundle["bars"] = adapter.fetch_daily_bars_by_date(trade_date)
+            bundle["factors"] = {
+                row["ts_code"]: row.get("adj_factor")
+                for row in adapter.fetch_adj_factors_by_date(trade_date)
+            }
+        if needs_indicators:
+            bundle["indicators"] = adapter.fetch_daily_indicators_by_date(trade_date)
+        return bundle
 
     def _save_prices(
         self,
@@ -330,16 +405,21 @@ class TushareSyncService:
                     _number(row.get("vol"), 100) or 0.0,
                     _number(row.get("amount"), 1000) or 0.0,
                     _number(factors.get(symbol)) or 1.0,
-                    TUSHARE_SNAPSHOT_ID,
+                    self.provider,
+                    self.snapshot_id,
                 )
             )
         with database.transaction() as connection:
+            self._ensure_instruments(
+                connection,
+                (value[0] for value in values),
+            )
             connection.executemany(
                 """
                 INSERT INTO prices
                     (symbol, trade_date, open, high, low, close, volume, amount,
                      adj_factor, source, snapshot_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'tushare', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, trade_date, snapshot_id) DO UPDATE SET
                     open = excluded.open,
                     high = excluded.high,
@@ -374,17 +454,22 @@ class TushareSyncService:
                     _number(row.get("free_share"), 10_000),
                     _number(row.get("total_mv"), 10_000),
                     _number(row.get("circ_mv"), 10_000),
+                    self.provider,
                     run_id,
                 )
             )
         with database.transaction() as connection:
+            self._ensure_instruments(
+                connection,
+                (value[0] for value in values),
+            )
             connection.executemany(
                 """
                 INSERT INTO daily_indicators
                     (symbol, trade_date, turnover_rate, volume_ratio, pe, pe_ttm, pb,
                      ps_ttm, dv_ttm, total_share, float_share, free_share, total_mv,
                      circ_mv, source, sync_run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tushare', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, trade_date) DO UPDATE SET
                     turnover_rate = excluded.turnover_rate,
                     volume_ratio = excluded.volume_ratio,
@@ -421,8 +506,8 @@ class TushareSyncService:
                     INSERT INTO indices
                         (index_code, name, fullname, market, publisher, index_type,
                          category, base_date, base_point, list_date, weight_rule,
-                         description, exp_date, source, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tushare', ?)
+                        description, exp_date, source, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(index_code) DO UPDATE SET
                         name = excluded.name,
                         fullname = excluded.fullname,
@@ -452,6 +537,7 @@ class TushareSyncService:
                         row.get("weight_rule"),
                         row.get("desc"),
                         _iso_date(row.get("exp_date")),
+                        self.provider,
                         now,
                     ),
                 )
@@ -466,9 +552,9 @@ class TushareSyncService:
                     """
                     INSERT OR IGNORE INTO indices
                         (index_code, name, source, updated_at)
-                    VALUES (?, ?, 'tushare', ?)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (index_code, index_code, now),
+                    (index_code, index_code, self.provider, now),
                 )
 
         for index_code in index_codes:
@@ -523,7 +609,7 @@ class TushareSyncService:
                     """
                     INSERT INTO index_constituents
                         (index_code, symbol, trade_date, weight, source, sync_run_id)
-                    VALUES (?, ?, ?, ?, 'tushare', ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(index_code, symbol, trade_date) DO UPDATE SET
                         weight = excluded.weight,
                         sync_run_id = excluded.sync_run_id
@@ -533,6 +619,7 @@ class TushareSyncService:
                         symbol,
                         _iso_date(row["trade_date"]),
                         _number(row.get("weight")) or 0.0,
+                        self.provider,
                         run_id,
                     ),
                 )
@@ -545,7 +632,7 @@ class TushareSyncService:
         run_id: str,
     ) -> int:
         total = 0
-        if settings.tushare_financial_vip:
+        if settings.tushare_financial_vip and not request.financial_symbols:
             for period in _quarter_ends(request.start_date, request.end_date):
                 rows = adapter.fetch_financial_indicators_vip(_api_date(period))
                 total += self._save_financials(rows, run_id)
@@ -605,15 +692,19 @@ class TushareSyncService:
                 )
             )
         with database.transaction() as connection:
+            self._ensure_instruments(
+                connection,
+                (value[0] for value in values),
+            )
             connection.executemany(
                 """
                 INSERT INTO financial_indicators
                     (symbol, ann_date, end_date, update_flag, eps, bps, roe, roa, roic,
                      grossprofit_margin, netprofit_margin, debt_to_assets,
                      current_ratio, quick_ratio, ocfps, netprofit_yoy, tr_yoy, or_yoy,
-                     q_netprofit_yoy, q_sales_yoy, source, sync_run_id, raw_json)
+                    q_netprofit_yoy, q_sales_yoy, source, sync_run_id, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        'tushare', ?, ?)
+                        ?, ?, ?)
                 ON CONFLICT(symbol, ann_date, end_date, update_flag) DO UPDATE SET
                     eps = excluded.eps,
                     bps = excluded.bps,
@@ -634,7 +725,7 @@ class TushareSyncService:
                     sync_run_id = excluded.sync_run_id,
                     raw_json = excluded.raw_json
                 """,
-                values,
+                [value[:-2] + (self.provider,) + value[-2:] for value in values],
             )
         return len(values)
 
@@ -644,8 +735,9 @@ class TushareSyncService:
                 """
                 SELECT COUNT(*) AS row_count, COUNT(DISTINCT symbol) AS symbols,
                        MIN(trade_date) AS start_date, MAX(trade_date) AS end_date
-                FROM prices WHERE source = 'tushare'
-                """
+                FROM prices WHERE source = ?
+                """,
+                (self.provider,),
             ).fetchone()
             financial_count = connection.execute(
                 "SELECT COUNT(*) AS count FROM financial_indicators"
@@ -657,12 +749,12 @@ class TushareSyncService:
                 "SELECT COUNT(*) AS count FROM index_constituents"
             ).fetchone()["count"]
         return {
-            "provider": "tushare",
+            "provider": self.provider,
             "configured": bool(settings.tushare_token),
             "financial_mode": (
                 "vip" if settings.tushare_financial_vip else "standard"
             ),
-            "snapshot_id": TUSHARE_SNAPSHOT_ID,
+            "snapshot_id": self.snapshot_id,
             "default_indices": list(settings.tushare_default_indices),
             "prices": dict(real_prices),
             "financial_rows": int(financial_count),

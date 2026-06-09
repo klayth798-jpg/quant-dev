@@ -4,7 +4,7 @@
 
 当前版本提供完整的本地纵向链路：
 
-- 可复现的 A 股研究数据快照
+- A 股研究数据集、运行参数和结果留痕
 - Tushare Pro 真实 A 股日线、复权因子、每日估值、财务指标和指数历史成分
 - 因子注册、版本和 RankIC/ICIR 评估
 - 包含佣金、印花税、滑点和 100 股整数手的回测
@@ -30,21 +30,48 @@ API 文档位于 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)。
 
 ## 真实 A 股数据
 
-复制环境变量模板并填写自己的 Tushare Token：
+项目支持官方 Tushare SDK 和兼容的 Tinyshare SDK。复制环境变量模板并填写授权信息：
 
 ```bash
 cp .env.example .env
 ```
 
 ```dotenv
-TUSHARE_TOKEN=你的_token
-TUSHARE_FINANCIAL_VIP=false
+QUANTDEV_DATA_MODE=real
+MARKET_DATA_SDK=tinyshare
+TINYSHARE_TOKEN=你的授权码
+TUSHARE_FINANCIAL_VIP=true
+TUSHARE_CALL_INTERVAL_SECONDS=0.15
 TUSHARE_DEFAULT_INDICES=000300.SH,000905.SH,000852.SH
 ```
 
-重启服务后进入“数据中心”，选择日期和数据模块并创建同步任务。同步在后台执行，页面会
+Tinyshare 首次使用需要单独安装：
+
+```bash
+make install-tinyshare
+```
+
+使用官方 Tushare 时改为：
+
+```dotenv
+MARKET_DATA_SDK=tushare
+TUSHARE_TOKEN=你的_token
+TUSHARE_FINANCIAL_VIP=false
+```
+
+`QUANTDEV_DATA_MODE=real` 会关闭启动时的 demo 数据注入。重启服务后进入“数据中心”，
+选择日期和数据模块并创建同步任务。同步在后台执行，页面会
 展示任务状态、写入行数与失败原因。已完成的交易日和指数月份会自动跳过，因此日常更新
 可以继续使用同一个日期区间。
+
+需要清空现有样本数据并切换到真实库时：
+
+```bash
+make reset-real
+.venv/bin/python -m quantdev.cli sync-market \
+  --start-date 2025-01-02 \
+  --end-date 2026-06-08
+```
 
 数据落库时执行以下单位标准化：
 
@@ -93,10 +120,18 @@ infra/                   容器部署
 
 ## 外部 API
 
-本地样例链路不要求任何 API。真实 A 股数据需要 `TUSHARE_TOKEN`；复用原
+本地样例链路不要求任何 API。真实 A 股数据需要 `TUSHARE_TOKEN` 或
+`TINYSHARE_TOKEN`；复用原
 `deep-research-quant` 服务时需要它的只读服务地址和鉴权方式。
 
 详细信息见 [docs/API_AND_PERMISSIONS.md](docs/API_AND_PERMISSIONS.md)。
+
+## 使用文档
+
+- [项目代码讲解](docs/PROJECT_CODE_GUIDE.md)
+- [前端操作手册](docs/FRONTEND_OPERATION_GUIDE.md)
+- [架构说明](docs/ARCHITECTURE.md)
+- [API 与权限清单](docs/API_AND_PERMISSIONS.md)
 
 ## 安全约束
 

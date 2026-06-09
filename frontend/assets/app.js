@@ -112,7 +112,7 @@ function renderOverview() {
   const metrics = latest?.metrics || {};
   workspace.innerHTML = `
     <div class="metric-grid">
-      ${metric("样本资产", state.dashboard.instrument_count, "A股研究标的")}
+      ${metric("研究资产", state.dashboard.instrument_count, "含真实行情的 A 股标的")}
       ${metric("已批准因子", state.dashboard.approved_factor_count, `共 ${state.dashboard.factor_count} 个因子`)}
       ${metric("最新年化收益", percent(metrics.annualized_return), latest?.name || "暂无回测", Number(metrics.annualized_return) >= 0 ? "positive" : "negative")}
       ${metric("最大回撤", percent(metrics.max_drawdown), "成本后回测", "negative")}
@@ -199,10 +199,10 @@ async function loadBacktestChart(runId, canvasId) {
   const detail = await api(`/api/backtests/${runId}`);
   state.activeBacktest = detail;
   const canvas = document.querySelector(`#${canvasId}`);
-  if (canvas) drawLineChart(canvas, detail.equity_curve, "equity");
+  if (canvas) drawLineChart(canvas, detail.equity_curve, "equity", "benchmark");
 }
 
-function drawLineChart(canvas, points, valueKey) {
+function drawLineChart(canvas, points, valueKey, benchmarkKey) {
   if (!points?.length) return;
   const rect = canvas.parentElement.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
@@ -214,8 +214,14 @@ function drawLineChart(canvas, points, valueKey) {
   const height = rect.height;
   const padding = { left: 58, right: 16, top: 18, bottom: 32 };
   const values = points.map((point) => Number(point[valueKey]));
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const hasBenchmark =
+    benchmarkKey && points.every((point) => point[benchmarkKey] != null);
+  const benchmarkValues = hasBenchmark
+    ? points.map((point) => Number(point[benchmarkKey]))
+    : [];
+  const allValues = values.concat(benchmarkValues);
+  const min = Math.min(...allValues);
+  const max = Math.max(...allValues);
   const spread = max - min || 1;
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
@@ -250,6 +256,23 @@ function drawLineChart(canvas, points, valueKey) {
   ctx.fillStyle = gradient;
   ctx.fill();
 
+  if (hasBenchmark) {
+    const benchmarkCoordinates = benchmarkValues.map((value, index) => ({
+      x: padding.left + (index / Math.max(1, benchmarkValues.length - 1)) * plotWidth,
+      y: padding.top + (1 - (value - min) / spread) * plotHeight,
+    }));
+    ctx.beginPath();
+    benchmarkCoordinates.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    });
+    ctx.strokeStyle = "#9aa3a0";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
   ctx.beginPath();
   coordinates.forEach((point, index) => {
     if (index === 0) ctx.moveTo(point.x, point.y);
@@ -263,11 +286,21 @@ function drawLineChart(canvas, points, valueKey) {
   const endText = points.at(-1).date;
   const endWidth = ctx.measureText(endText).width;
   ctx.fillText(endText, width - padding.right - endWidth, height - 9);
+  if (hasBenchmark) {
+    ctx.fillStyle = "#0b7a53";
+    ctx.fillText("— 策略", padding.left, padding.top - 4);
+    ctx.fillStyle = "#9aa3a0";
+    ctx.fillText("--- 等权基准", padding.left + 56, padding.top - 4);
+  }
 }
 
 function renderData() {
   const status = state.dataStatus;
   const requirements = state.requirements.optional_data_apis;
+  const providerName =
+    status.provider === "tinyshare" ? "Tinyshare 代理接口" : "Tushare Pro";
+  const tokenName =
+    status.provider === "tinyshare" ? "TINYSHARE_TOKEN" : "TUSHARE_TOKEN";
   const defaultEnd = new Date().toISOString().slice(0, 10);
   const defaultStartDate = new Date();
   defaultStartDate.setFullYear(defaultStartDate.getFullYear() - 1);
@@ -283,8 +316,8 @@ function renderData() {
     <div class="requirement-band ${status.configured ? "configured" : ""}">
       ${
         status.configured
-          ? `Tushare Pro 已配置，当前使用 <span class="mono">${escapeHtml(status.financial_mode)}</span> 财务接口。同步任务在后台运行，重复日期会自动跳过。`
-          : `尚未配置真实数据权限。请在项目根目录 <span class="mono">.env</span> 写入 <span class="mono">TUSHARE_TOKEN</span> 并重启服务；Token 不会显示在页面或写入数据库。`
+          ? `${providerName}已配置，当前使用 <span class="mono">${escapeHtml(status.financial_mode)}</span> 财务接口。同步任务在后台运行，重复日期会自动跳过。`
+          : `尚未配置真实数据权限。请在项目根目录 <span class="mono">.env</span> 写入 <span class="mono">${tokenName}</span> 并重启服务；授权码不会显示在页面或写入数据库。`
       }
     </div>
     <div class="metric-grid">
@@ -296,7 +329,7 @@ function renderData() {
     <section class="panel" style="margin-top:24px">
       <div class="panel-header">
         <div><h2>同步真实 A 股数据</h2><p>行情、复权因子、每日估值、财务指标和历史指数权重</p></div>
-        <span class="badge ${status.configured ? "" : "disabled"}">${status.configured ? "READY" : "TOKEN REQUIRED"}</span>
+        <span class="badge ${status.configured ? "" : "disabled"}">${status.configured ? escapeHtml(status.provider.toUpperCase()) : "TOKEN REQUIRED"}</span>
       </div>
       <form id="tushare-sync-form">
         <div class="form-grid">
@@ -478,6 +511,10 @@ function renderFactors() {
         <div><h2>因子目录</h2><p>评估采用 RankIC、ICIR、分组多空收益和样本覆盖</p></div>
         <span class="badge">POINT-IN-TIME</span>
       </div>
+      <div class="form-grid compact-form">
+        <div class="field"><label for="factor-forward-days">预测周期（交易日）</label><input id="factor-forward-days" type="number" value="5" min="1" max="60" /></div>
+        <div class="field"><label for="factor-neutralize">行业市值中性化</label><select id="factor-neutralize"><option value="false">否</option><option value="true">是</option></select></div>
+      </div>
       <div class="table-shell">
         <table>
           <thead><tr><th>因子</th><th>分类</th><th>表达式</th><th>版本</th><th>IC</th><th>ICIR</th><th>多空年化</th><th>操作</th></tr></thead>
@@ -510,9 +547,14 @@ async function evaluateFactor(button) {
   button.disabled = true;
   button.textContent = "计算中";
   try {
+    const forwardDays = Number(document.querySelector("#factor-forward-days").value);
+    const neutralize = document.querySelector("#factor-neutralize").value === "true";
     const result = await api(`/api/factors/${button.dataset.factor}/evaluate`, {
       method: "POST",
-      body: JSON.stringify({ forward_days: 5 }),
+      body: JSON.stringify({
+        forward_days: forwardDays,
+        neutralize,
+      }),
     });
     showToast(`评估完成，IC ${number(result.metrics.ic_mean, 4)}`);
     await loadCoreData();
@@ -546,8 +588,13 @@ function renderBacktest() {
           <div class="field span-2"><label for="bt-name">实验名称</label><input id="bt-name" name="name" value="多因子选股回测" /></div>
           <div class="field"><label for="bt-factor">选股因子</label><select id="bt-factor" name="factor_id">${factorOptions()}</select></div>
           <div class="field"><label for="bt-capital">初始资金</label><input id="bt-capital" name="initial_capital" type="number" value="1000000" min="10000" /></div>
-          <div class="field"><label for="bt-top">持仓数量</label><input id="bt-top" name="top_n" type="number" value="3" min="1" max="8" /></div>
+          <div class="field"><label for="bt-top">持仓数量</label><input id="bt-top" name="top_n" type="number" value="3" min="1" max="20" /></div>
           <div class="field"><label for="bt-rebalance">调仓周期（交易日）</label><input id="bt-rebalance" name="rebalance_days" type="number" value="5" min="1" max="60" /></div>
+          <div class="field"><label for="bt-universe">股票池</label><select id="bt-universe" name="universe"><option value="">全市场</option><option value="000300.SH">沪深300</option><option value="000905.SH">中证500</option><option value="000852.SH">中证1000</option><option value="000300.SH,000905.SH">沪深300+中证500</option></select></div>
+          <div class="field"><label for="bt-buffer">持仓缓冲带</label><select id="bt-buffer" name="buffer_multiple"><option value="1">关闭</option><option value="1.5">1.5x</option><option value="2">2.0x</option><option value="3">3.0x</option></select></div>
+          <div class="field"><label for="bt-exclude-st">剔除ST</label><select id="bt-exclude-st" name="exclude_st"><option value="false">否</option><option value="true">是</option></select></div>
+          <div class="field"><label for="bt-price-limit">涨跌停约束</label><select id="bt-price-limit" name="apply_price_limit"><option value="false">否</option><option value="true">是</option></select></div>
+          <div class="field"><label for="bt-neutralize">行业市值中性化</label><select id="bt-neutralize" name="neutralize"><option value="false">否</option><option value="true">是</option></select></div>
           <div class="field"><label for="bt-commission">佣金率</label><input id="bt-commission" name="commission_rate" type="number" step="0.0001" value="0.0003" /></div>
           <div class="field"><label for="bt-slippage">滑点（bps）</label><input id="bt-slippage" name="slippage_bps" type="number" value="5" min="0" max="100" /></div>
         </div>
@@ -563,6 +610,16 @@ function renderBacktest() {
 
 function backtestResultMarkup(result) {
   const metrics = result.metrics;
+  const hasBenchmark = metrics.alpha != null;
+  const excessRow = hasBenchmark
+    ? `
+    <div class="metric-grid" style="margin-top:16px">
+      ${metric("超额收益", percent(metrics.excess_return), `基准 ${percent(metrics.benchmark_return)}`, metrics.excess_return >= 0 ? "positive" : "negative")}
+      ${metric("年化Alpha", percent(metrics.alpha), "策略年化-基准年化", metrics.alpha >= 0 ? "positive" : "negative")}
+      ${metric("信息比率", number(metrics.information_ratio), "Alpha/跟踪误差")}
+      ${metric("超额最大回撤", percent(metrics.excess_max_drawdown), "相对基准", "negative")}
+    </div>`
+    : "";
   return `
     <div class="metric-grid" style="margin-top:24px">
       ${metric("总收益", percent(metrics.total_return), "成本后", metrics.total_return >= 0 ? "positive" : "negative")}
@@ -570,6 +627,7 @@ function backtestResultMarkup(result) {
       ${metric("夏普比率", number(metrics.sharpe_ratio), "无风险利率 2%")}
       ${metric("最大回撤", percent(metrics.max_drawdown), "峰值到谷值", "negative")}
     </div>
+    ${excessRow}
     <section class="panel" style="margin-top:24px">
       <div class="panel-header">
         <div><h2>${escapeHtml(result.name)}</h2><p>${escapeHtml(result.run_id)}</p></div>
@@ -583,6 +641,7 @@ async function runBacktest(event) {
   event.preventDefault();
   const button = event.currentTarget.querySelector("button[type=submit]");
   const data = new FormData(event.currentTarget);
+  const universeValue = data.get("universe");
   const payload = {
     name: data.get("name"),
     factor_id: data.get("factor_id"),
@@ -592,6 +651,11 @@ async function runBacktest(event) {
     commission_rate: Number(data.get("commission_rate")),
     stamp_duty_rate: 0.0005,
     slippage_bps: Number(data.get("slippage_bps")),
+    universe_indices: universeValue ? universeValue.split(",") : null,
+    buffer_multiple: Number(data.get("buffer_multiple")),
+    exclude_st: data.get("exclude_st") === "true",
+    apply_price_limit: data.get("apply_price_limit") === "true",
+    neutralize: data.get("neutralize") === "true",
   };
   button.disabled = true;
   button.textContent = "正在回测";
@@ -602,7 +666,7 @@ async function runBacktest(event) {
     });
     state.activeBacktest = result;
     document.querySelector("#backtest-result").innerHTML = backtestResultMarkup(result);
-    drawLineChart(document.querySelector("#backtest-chart"), result.equity_curve, "equity");
+    drawLineChart(document.querySelector("#backtest-chart"), result.equity_curve, "equity", "benchmark");
     showToast(`回测完成，生成 ${result.trades.length} 笔成交`);
     await loadCoreData();
   } catch (error) {
@@ -618,7 +682,7 @@ function renderRisk() {
     <div class="workspace-grid">
       <section class="panel">
         <div class="panel-header">
-          <div><h2>组合预交易检查</h2><p>订单进入 OMS 前必须通过全部硬规则</p></div>
+          <div><h2>组合预交易检查</h2><p>模拟买单复用同一套仓位、敞口、回撤和单笔规则</p></div>
           <span class="badge">PRE-TRADE</span>
         </div>
         <form id="risk-form">
@@ -732,7 +796,7 @@ function renderPaper() {
     <div class="workspace-grid">
       <section class="panel">
         <div class="panel-header">
-          <div><h2>提交模拟委托</h2><p>经过订单规模、现金和持仓检查后即时撮合</p></div>
+          <div><h2>提交模拟委托</h2><p>市价单即时模拟成交，未触及的限价单保持挂起</p></div>
           <span class="badge">PAPER ONLY</span>
         </div>
         <form id="paper-order-form">
@@ -740,6 +804,8 @@ function renderPaper() {
             <div class="field span-2"><label for="paper-symbol">标的</label><select id="paper-symbol">${instrumentOptions(0)}</select></div>
             <div class="field"><label for="paper-side">方向</label><select id="paper-side"><option value="buy">买入</option><option value="sell">卖出</option></select></div>
             <div class="field"><label for="paper-quantity">数量</label><input id="paper-quantity" type="number" value="100" step="100" min="100" /></div>
+            <div class="field"><label for="paper-order-type">委托类型</label><select id="paper-order-type"><option value="market">市价</option><option value="limit">限价</option></select></div>
+            <div class="field"><label for="paper-limit-price">限价</label><input id="paper-limit-price" type="number" min="0.01" step="0.01" disabled /></div>
           </div>
           <div class="form-actions"><button class="button" type="submit">提交模拟委托</button></div>
         </form>
@@ -764,6 +830,12 @@ function renderPaper() {
       ${paperOrdersTable(account.orders)}
     </section>`;
   document.querySelector("#paper-order-form").addEventListener("submit", submitPaperOrder);
+  document.querySelector("#paper-order-type").addEventListener("change", (event) => {
+    const limitInput = document.querySelector("#paper-limit-price");
+    limitInput.disabled = event.currentTarget.value !== "limit";
+    limitInput.required = event.currentTarget.value === "limit";
+    if (limitInput.disabled) limitInput.value = "";
+  });
 }
 
 function paperPositionsTable(items) {
@@ -797,6 +869,8 @@ async function submitPaperOrder(event) {
   button.disabled = true;
   button.textContent = "提交中";
   const clientOrderId = `web-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const orderType = document.querySelector("#paper-order-type").value;
+  const limitPrice = document.querySelector("#paper-limit-price").value;
   try {
     const result = await api("/api/paper/orders", {
       method: "POST",
@@ -805,11 +879,18 @@ async function submitPaperOrder(event) {
         symbol: document.querySelector("#paper-symbol").value,
         side: document.querySelector("#paper-side").value,
         quantity: Number(document.querySelector("#paper-quantity").value),
-        order_type: "market",
+        order_type: orderType,
+        limit_price: orderType === "limit" ? Number(limitPrice) : null,
       }),
     });
     state.paperAccount = result.account;
-    showToast(result.status === "FILLED" ? `成交完成，价格 ${number(result.fill_price, 4)}` : result.reject_reason, result.status === "FILLED" ? "info" : "error");
+    const message =
+      result.status === "FILLED"
+        ? `成交完成，价格 ${number(result.fill_price, 4)}`
+        : result.status === "OPEN"
+          ? "限价未触及，委托已挂起"
+          : result.reject_reason;
+    showToast(message, result.status === "REJECTED" ? "error" : "info");
     renderPaper();
   } catch (error) {
     showToast(error.message, "error");
@@ -884,7 +965,7 @@ document.querySelector("#refresh-button").addEventListener("click", async () => 
 window.addEventListener("resize", () => {
   if (state.view === "overview" && state.activeBacktest) {
     const canvas = document.querySelector("#overview-chart");
-    if (canvas) drawLineChart(canvas, state.activeBacktest.equity_curve, "equity");
+    if (canvas) drawLineChart(canvas, state.activeBacktest.equity_curve, "equity", "benchmark");
   }
 });
 

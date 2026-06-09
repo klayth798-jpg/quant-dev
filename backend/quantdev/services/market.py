@@ -46,6 +46,13 @@ FACTOR_DEFINITIONS = [
         "流动性",
         "mean(volume, 5) / mean(volume, 20) - 1",
     ),
+    (
+        "composite_multi",
+        "多因子合成",
+        "低波(0.6)与反转(0.4)经截面去极值标准化后加权合成的多因子模型。",
+        "合成",
+        "0.6*zscore(low_volatility_20) + 0.4*zscore(reversal_5)",
+    ),
 ]
 
 
@@ -62,8 +69,51 @@ def trading_days(start: date, count: int) -> List[date]:
 class MarketDataService:
     demo_snapshot_id = "demo-cn-equity-20260605-v1"
 
+    def ensure_factor_definitions(self) -> None:
+        with database.transaction() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO factor_definitions
+                    (factor_id, name, description, category, expression, version,
+                     status, created_at)
+                VALUES (?, ?, ?, ?, ?, '1.0.0', 'approved', ?)
+                """,
+                [item + (utc_now(),) for item in FACTOR_DEFINITIONS],
+            )
+
+    def reset_for_real_data(self) -> Dict[str, Any]:
+        database.migrate()
+        with database.transaction() as connection:
+            for table in (
+                "paper_fills",
+                "paper_orders",
+                "paper_positions",
+                "paper_accounts",
+                "backtest_runs",
+                "factor_runs",
+                "risk_events",
+                "audit_log",
+                "index_constituents",
+                "financial_indicators",
+                "daily_indicators",
+                "prices",
+                "instrument_metadata",
+                "trade_calendar",
+                "data_sync_runs",
+                "indices",
+                "instruments",
+            ):
+                connection.execute(f"DELETE FROM {table}")
+        self.ensure_factor_definitions()
+        return {
+            "status": "ready",
+            "database": str(database.path),
+            "message": "研究数据与模拟账本已清空，可以同步真实数据",
+        }
+
     def bootstrap_demo_data(self, force: bool = False) -> Dict[str, Any]:
         database.migrate()
+        self.ensure_factor_definitions()
         with database.connect() as connection:
             existing = connection.execute("SELECT COUNT(*) AS count FROM prices").fetchone()
         if existing and existing["count"] and not force:
@@ -146,16 +196,6 @@ class MarketDataService:
                 """,
                 price_rows,
             )
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO factor_definitions
-                    (factor_id, name, description, category, expression, version,
-                     status, created_at)
-                VALUES (?, ?, ?, ?, ?, '1.0.0', 'approved', ?)
-                """,
-                [item + (utc_now(),) for item in FACTOR_DEFINITIONS],
-            )
-
         return {
             "status": "created",
             "snapshot_id": self.demo_snapshot_id,

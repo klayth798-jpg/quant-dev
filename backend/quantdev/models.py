@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class FactorEvaluateRequest(BaseModel):
     forward_days: int = Field(default=5, ge=1, le=60)
+    neutralize: bool = False
 
 
 class BacktestRequest(BaseModel):
@@ -17,6 +18,11 @@ class BacktestRequest(BaseModel):
     commission_rate: float = Field(default=0.0003, ge=0, le=0.01)
     stamp_duty_rate: float = Field(default=0.0005, ge=0, le=0.01)
     slippage_bps: float = Field(default=5, ge=0, le=100)
+    universe_indices: Optional[List[str]] = None
+    buffer_multiple: float = Field(default=1.0, ge=1.0, le=3.0)
+    exclude_st: bool = False
+    apply_price_limit: bool = False
+    neutralize: bool = False
 
 
 class PositionInput(BaseModel):

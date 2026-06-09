@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS prices (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(trade_date);
+CREATE INDEX IF NOT EXISTS idx_prices_snapshot_date_symbol
+ON prices(snapshot_id, trade_date, symbol);
 
 CREATE TABLE IF NOT EXISTS instrument_metadata (
     symbol TEXT PRIMARY KEY,
@@ -81,6 +83,9 @@ CREATE TABLE IF NOT EXISTS daily_indicators (
     PRIMARY KEY (symbol, trade_date),
     FOREIGN KEY (symbol) REFERENCES instruments(symbol)
 );
+
+CREATE INDEX IF NOT EXISTS idx_daily_indicators_date_symbol
+ON daily_indicators(trade_date, symbol);
 
 CREATE TABLE IF NOT EXISTS financial_indicators (
     symbol TEXT NOT NULL,
@@ -145,6 +150,9 @@ CREATE TABLE IF NOT EXISTS index_constituents (
 
 CREATE INDEX IF NOT EXISTS idx_index_constituents_date
 ON index_constituents(index_code, trade_date);
+
+CREATE INDEX IF NOT EXISTS idx_index_constituents_code_date_symbol
+ON index_constituents(index_code, trade_date, symbol);
 
 CREATE TABLE IF NOT EXISTS data_sync_runs (
     run_id TEXT PRIMARY KEY,

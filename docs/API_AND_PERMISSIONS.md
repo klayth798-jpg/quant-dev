@@ -6,6 +6,26 @@
 
 ## 真实 A 股模式
 
+### Tinyshare 兼容接口
+
+环境变量：
+
+```dotenv
+QUANTDEV_DATA_MODE=real
+MARKET_DATA_SDK=tinyshare
+TINYSHARE_TOKEN=
+TUSHARE_FINANCIAL_VIP=true
+```
+
+安装命令：
+
+```bash
+make install-tinyshare
+```
+
+Tinyshare 通过兼容 SDK 提供下列 Tushare 风格接口。授权码只允许写入本地 `.env` 或
+部署密钥系统，不得提交到 Git。
+
 ### Tushare Pro
 
 环境变量：`TUSHARE_TOKEN`
@@ -33,7 +53,8 @@ TUSHARE_CALL_INTERVAL_SECONDS=0.35
 TUSHARE_DEFAULT_INDICES=000300.SH,000905.SH,000852.SH
 ```
 
-Token 请只写入项目根目录 `.env` 或部署密钥系统，不要发在聊天消息或提交到 GitHub。
+Token 或代理授权码请只写入项目根目录 `.env` 或部署密钥系统，不要发在聊天消息或提交
+到 GitHub。
 首次同步一年日线会按交易日调用行情、复权和每日指标接口，通常需要数分钟；之后会跳过
 已完成日期。
 
@@ -46,7 +67,8 @@ Token 请只写入项目根目录 `.env` 或部署密钥系统，不要发在聊
 - `GET /api/data/indices`
 - `GET /api/data/financials/{symbol}`
 
-当前尚未接入分钟线、停复牌、ST 标签和涨跌停价格，这些会作为后续数据质量模块加入。
+当前尚未接入分钟线、历史停复牌、历史 ST 标签和交易所官方每日涨跌停价格。回测中的
+ST 与涨跌停约束是基于最新名称和板块规则的近似模型。
 
 ### deep-research-quant
 

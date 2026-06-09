@@ -13,7 +13,7 @@ def test_dashboard_and_factor_endpoints():
     assert dashboard.status_code == 200
     assert dashboard.json()["instrument_count"] == 8
     assert factors.status_code == 200
-    assert len(factors.json()["items"]) == 4
+    assert len(factors.json()["items"]) == 5
 
 
 def test_risk_endpoint():
@@ -48,4 +48,4 @@ def test_tushare_sync_requires_token(monkeypatch):
         )
 
     assert response.status_code == 409
-    assert "TUSHARE_TOKEN" in response.json()["detail"]
+    assert "TOKEN" in response.json()["detail"]

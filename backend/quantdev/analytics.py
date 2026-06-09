@@ -100,6 +100,57 @@ def summarize_equity(equity: Sequence[float]) -> Dict[str, float]:
     }
 
 
+def excess_metrics(
+    strategy_equity: Sequence[float],
+    benchmark_equity: Sequence[float],
+    periods_per_year: int = 252,
+) -> Dict[str, float]:
+    """计算策略相对基准的超额表现指标。
+
+    - benchmark_return / benchmark_max_drawdown：基准自身表现
+    - alpha：年化超额收益（策略年化 - 基准年化）
+    - information_ratio：年化超额收益 / 年化跟踪误差
+    - tracking_error：超额日收益的年化波动率
+    - excess_max_drawdown：超额净值曲线（策略/基准）的最大回撤
+    """
+    if len(strategy_equity) != len(benchmark_equity) or len(strategy_equity) < 2:
+        return {}
+    strategy_returns = returns_from_equity(strategy_equity)
+    benchmark_returns = returns_from_equity(benchmark_equity)
+    active_returns = [s - b for s, b in zip(strategy_returns, benchmark_returns)]
+    tracking_error = sample_std(active_returns) * math.sqrt(periods_per_year)
+    strategy_annual = annualized_return(strategy_equity, periods_per_year)
+    benchmark_annual = annualized_return(benchmark_equity, periods_per_year)
+    alpha = strategy_annual - benchmark_annual
+    relative_equity = [
+        s / b if b else 1.0 for s, b in zip(strategy_equity, benchmark_equity)
+    ]
+    return {
+        "benchmark_return": round(
+            benchmark_equity[-1] / benchmark_equity[0] - 1
+            if benchmark_equity[0]
+            else 0.0,
+            6,
+        ),
+        "benchmark_annualized_return": round(benchmark_annual, 6),
+        "benchmark_max_drawdown": round(max_drawdown(benchmark_equity), 6),
+        "alpha": round(alpha, 6),
+        "tracking_error": round(tracking_error, 6),
+        "information_ratio": round(alpha / tracking_error, 4)
+        if tracking_error
+        else 0.0,
+        "excess_return": round(
+            (strategy_equity[-1] / strategy_equity[0])
+            / (benchmark_equity[-1] / benchmark_equity[0])
+            - 1
+            if strategy_equity[0] and benchmark_equity[0] and benchmark_equity[-1]
+            else 0.0,
+            6,
+        ),
+        "excess_max_drawdown": round(max_drawdown(relative_equity), 6),
+    }
+
+
 def group_by_date(
     rows: Iterable[Dict[str, object]],
 ) -> Tuple[List[str], Dict[str, List[Dict[str, object]]]]:

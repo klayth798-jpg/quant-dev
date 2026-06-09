@@ -18,18 +18,23 @@ class RiskService:
     def __init__(self, policy: RiskPolicy = None):
         self.policy = policy or RiskPolicy()
 
-    def check(self, request: RiskCheckRequest) -> Dict[str, Any]:
+    def evaluate(self, request: RiskCheckRequest) -> Dict[str, Any]:
         breaches: List[Dict[str, str]] = []
-        total_weight = sum(position.weight for position in request.positions)
+        weights_by_symbol: Dict[str, float] = {}
         for position in request.positions:
-            if position.weight > self.policy.max_single_position:
+            weights_by_symbol[position.symbol] = (
+                weights_by_symbol.get(position.symbol, 0.0) + position.weight
+            )
+        total_weight = sum(weights_by_symbol.values())
+        for symbol, weight in weights_by_symbol.items():
+            if weight > self.policy.max_single_position:
                 breaches.append(
                     {
                         "rule_code": "MAX_SINGLE_POSITION",
                         "severity": "high",
                         "message": "{} 仓位 {:.1%} 超过 {:.1%}".format(
-                            position.symbol,
-                            position.weight,
+                            symbol,
+                            weight,
                             self.policy.max_single_position,
                         ),
                     }
@@ -74,10 +79,6 @@ class RiskService:
                 breaches.append(
                     {"rule_code": code, "severity": severity, "message": message}
                 )
-        for breach in breaches:
-            store.save_risk_event(
-                breach["severity"], breach["rule_code"], breach["message"], request.model_dump()
-            )
         return {
             "approved": not breaches,
             "decision": "APPROVED" if not breaches else "REJECTED",
@@ -91,6 +92,17 @@ class RiskService:
                 "max_order_notional_weight": self.policy.max_order_notional_weight,
             },
         }
+
+    def check(self, request: RiskCheckRequest) -> Dict[str, Any]:
+        result = self.evaluate(request)
+        for breach in result["breaches"]:
+            store.save_risk_event(
+                breach["severity"],
+                breach["rule_code"],
+                breach["message"],
+                request.model_dump(),
+            )
+        return result
 
 
 risk_service = RiskService()

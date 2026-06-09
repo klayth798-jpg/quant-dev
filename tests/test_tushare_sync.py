@@ -176,9 +176,10 @@ def test_tushare_sync_persists_market_financial_and_index_data():
         price = connection.execute(
             """
             SELECT * FROM prices
-            WHERE symbol = '000001.SZ' AND source = 'tushare'
+            WHERE symbol = '000001.SZ' AND source = ?
             ORDER BY trade_date LIMIT 1
-            """
+            """,
+            (service.provider,),
         ).fetchone()
         indicator = connection.execute(
             """

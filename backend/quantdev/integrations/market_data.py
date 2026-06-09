@@ -1,5 +1,6 @@
 import time
 from abc import ABC, abstractmethod
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional
 
 from quantdev.config import settings
@@ -26,18 +27,29 @@ class TushareAdapter(MarketDataAdapter):
         self.call_interval_seconds = call_interval_seconds
         self.max_retries = max_retries
         self._last_call_at = 0.0
+        self._throttle_lock = Lock()
+        sdk_name = settings.market_data_sdk
+        if sdk_name not in {"tushare", "tinyshare"}:
+            raise ValueError("MARKET_DATA_SDK 只能是 tushare 或 tinyshare")
         try:
-            import tushare as ts
+            if sdk_name == "tinyshare":
+                import tinyshare as ts
+            else:
+                import tushare as ts
         except ImportError as exc:
-            raise RuntimeError("缺少 tushare 依赖，请重新安装项目依赖") from exc
+            raise RuntimeError(
+                f"缺少 {sdk_name} 依赖，请先安装对应行情 SDK"
+            ) from exc
         ts.set_token(token)
-        self.pro = ts.pro_api(token)
+        self.pro = ts.pro_api()
 
     def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_call_at
-        remaining = self.call_interval_seconds - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
+        with self._throttle_lock:
+            elapsed = time.monotonic() - self._last_call_at
+            remaining = self.call_interval_seconds - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_call_at = time.monotonic()
 
     def _call(self, endpoint: str, **kwargs) -> List[Dict[str, Any]]:
         last_error: Optional[Exception] = None
@@ -45,7 +57,6 @@ class TushareAdapter(MarketDataAdapter):
             try:
                 self._throttle()
                 frame = getattr(self.pro, endpoint)(**kwargs)
-                self._last_call_at = time.monotonic()
                 if frame is None or frame.empty:
                     return []
                 return frame.where(frame.notna(), None).to_dict(orient="records")
@@ -53,7 +64,9 @@ class TushareAdapter(MarketDataAdapter):
                 last_error = exc
                 if attempt + 1 < self.max_retries:
                     time.sleep(1.5 * (attempt + 1))
-        raise RuntimeError(f"Tushare {endpoint} 调用失败: {last_error}") from last_error
+        raise RuntimeError(
+            f"{settings.market_data_sdk} {endpoint} 调用失败: {last_error}"
+        ) from last_error
 
     def fetch_stock_basic(self, list_status: str) -> List[Dict[str, Any]]:
         return self._call(
