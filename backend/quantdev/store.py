@@ -65,6 +65,32 @@ class Store:
             ).fetchone()
         return dict(row)
 
+    def snapshot_max_date(self, snapshot_id: str) -> Optional[str]:
+        """快照内全市场最新交易日（用于判断单个标的是否停牌/缺当日数据）。"""
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT MAX(trade_date) AS max_date FROM prices WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+        return row["max_date"] if row and row["max_date"] else None
+
+    def symbol_price_tail(
+        self, symbol: str, snapshot_id: str, limit: int = 2
+    ) -> List[Dict[str, Any]]:
+        """某标的在快照中按交易日倒序的最近 N 条行情（默认最近两日）。"""
+        with database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT trade_date, close
+                FROM prices
+                WHERE snapshot_id = ? AND symbol = ?
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (snapshot_id, symbol, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_data_sync_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         with database.connect() as connection:
             row = connection.execute(
@@ -358,6 +384,233 @@ class Store:
                     utc_now(),
                 ),
             )
+
+
+    def get_flag(self, flag: str) -> Optional[Dict[str, Any]]:
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM system_flags WHERE flag = ?", (flag,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def calendar_entry(
+        self, cal_date: str, exchange: str = "SSE"
+    ) -> Optional[Dict[str, Any]]:
+        """查询交易日历中某一天的记录；无数据时返回 None（由调用方决定兜底）。"""
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM trade_calendar WHERE exchange = ? AND cal_date = ?",
+                (exchange, cal_date),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def append_order_event(
+        self,
+        connection,
+        order_id: str,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """向订单事件流追加一条事件（append-only）。
+
+        seq 在同一 order_id 下单调递增，复用调用方的事务连接以保证原子性。
+        """
+        row = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM order_events WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        next_seq = int(row["max_seq"]) + 1
+        connection.execute(
+            """
+            INSERT INTO order_events
+                (event_id, order_id, seq, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("oevt"),
+                order_id,
+                next_seq,
+                event_type,
+                json.dumps(payload, ensure_ascii=True),
+                utc_now(),
+            ),
+        )
+
+    def list_order_events(self, order_id: str) -> List[Dict[str, Any]]:
+        with database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM order_events WHERE order_id = ? ORDER BY seq",
+                (order_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = decode_json(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def set_flag(
+        self, flag: str, value: str, reason: str, updated_by: str
+    ) -> Dict[str, Any]:
+        now = utc_now()
+        with database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO system_flags (flag, value, reason, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(flag) DO UPDATE SET
+                    value = excluded.value,
+                    reason = excluded.reason,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (flag, value, reason, updated_by, now),
+            )
+        return {
+            "flag": flag,
+            "value": value,
+            "reason": reason,
+            "updated_by": updated_by,
+            "updated_at": now,
+        }
+
+    def save_reconciliation(self, report: Dict[str, Any]) -> str:
+        recon_id = new_id("recon")
+        with database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO reconciliations
+                    (recon_id, broker_mode, status, cash_diff, position_break_count,
+                     breaks_json, local_json, broker_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    recon_id,
+                    report["broker_mode"],
+                    report["status"],
+                    report["cash_diff"],
+                    len(report["breaks"]),
+                    json.dumps(report["breaks"], ensure_ascii=True),
+                    json.dumps(report["local"], ensure_ascii=True),
+                    json.dumps(report["broker"], ensure_ascii=True),
+                    utc_now(),
+                ),
+            )
+        return recon_id
+
+    def list_reconciliations(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM reconciliations ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._decode_reconciliation(row) for row in rows]
+
+    def get_reconciliation(self, recon_id: str) -> Optional[Dict[str, Any]]:
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM reconciliations WHERE recon_id = ?", (recon_id,)
+            ).fetchone()
+        return self._decode_reconciliation(row) if row else None
+
+    @staticmethod
+    def _decode_reconciliation(row) -> Dict[str, Any]:
+        item = dict(row)
+        item["breaks"] = decode_json(item.pop("breaks_json"))
+        item["local"] = decode_json(item.pop("local_json"))
+        item["broker"] = decode_json(item.pop("broker_json"))
+        return item
+
+    def record_domain_event(
+        self,
+        event_type: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: Dict[str, Any],
+        actor: str = "system",
+    ) -> Dict[str, Any]:
+        """持久化一条全局领域事件（append-only），seq 全局单调递增。"""
+        event_id = new_id("evt")
+        created_at = utc_now()
+        with database.transaction() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM domain_events"
+            ).fetchone()
+            next_seq = int(row["max_seq"]) + 1
+            connection.execute(
+                """
+                INSERT INTO domain_events
+                    (event_id, seq, event_type, aggregate_type, aggregate_id,
+                     actor, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    next_seq,
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    actor,
+                    json.dumps(payload, ensure_ascii=True),
+                    created_at,
+                ),
+            )
+        return {
+            "event_id": event_id,
+            "seq": next_seq,
+            "event_type": event_type,
+            "aggregate_type": aggregate_type,
+            "aggregate_id": aggregate_id,
+            "actor": actor,
+            "payload": payload,
+            "created_at": created_at,
+        }
+
+    def list_domain_events(
+        self,
+        limit: int = 50,
+        event_type: Optional[str] = None,
+        aggregate_type: Optional[str] = None,
+        aggregate_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM domain_events WHERE 1 = 1"
+        params: List[Any] = []
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if aggregate_type:
+            query += " AND aggregate_type = ?"
+            params.append(aggregate_type)
+        if aggregate_id:
+            query += " AND aggregate_id = ?"
+            params.append(aggregate_id)
+        query += " ORDER BY seq DESC LIMIT ?"
+        params.append(limit)
+        with database.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = decode_json(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def paper_trading_stats(self) -> Dict[str, Any]:
+        """模拟盘活跃度统计：成交订单数 + 覆盖的交易日数（按成交日期去重）。
+
+        用于"连续模拟盘"阶段判断是否已积累足够交易日的真实下单记录。
+        """
+        with database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS filled_orders,
+                       COUNT(DISTINCT substr(filled_at, 1, 10)) AS trading_days,
+                       MIN(filled_at) AS first_fill,
+                       MAX(filled_at) AS last_fill
+                FROM paper_fills
+                """
+            ).fetchone()
+        return dict(row)
 
 
 store = Store()

@@ -20,6 +20,8 @@ class Settings:
     environment: str
     data_mode: str
     database_path: Path
+    database_backend: str
+    database_url: str
     log_level: str
     deep_research_base_url: str
     deep_research_api_key: str
@@ -28,6 +30,11 @@ class Settings:
     tushare_financial_vip: bool
     tushare_call_interval_seconds: float
     tushare_default_indices: tuple
+    broker_mode: str
+    live_trading_enabled: bool
+    require_order_approval: bool
+    max_live_order_notional: float
+    max_daily_loss: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,6 +44,8 @@ class Settings:
             database_path=_resolve_path(
                 os.getenv("QUANTDEV_DATABASE_PATH", "./data/quantdev.db")
             ),
+            database_backend=os.getenv("QUANTDEV_DATABASE_BACKEND", "sqlite").lower(),
+            database_url=os.getenv("QUANTDEV_DATABASE_URL", ""),
             log_level=os.getenv("QUANTDEV_LOG_LEVEL", "INFO"),
             deep_research_base_url=os.getenv("DEEP_RESEARCH_BASE_URL", "").rstrip("/"),
             deep_research_api_key=os.getenv("DEEP_RESEARCH_API_KEY", ""),
@@ -58,6 +67,19 @@ class Settings:
                 ).split(",")
                 if item.strip()
             ),
+            broker_mode=os.getenv("QUANTDEV_BROKER_MODE", "disabled").lower(),
+            live_trading_enabled=os.getenv(
+                "QUANTDEV_LIVE_TRADING_ENABLED", "false"
+            ).lower()
+            == "true",
+            require_order_approval=os.getenv(
+                "QUANTDEV_REQUIRE_ORDER_APPROVAL", "true"
+            ).lower()
+            == "true",
+            max_live_order_notional=float(
+                os.getenv("QUANTDEV_MAX_LIVE_ORDER_NOTIONAL", "5000")
+            ),
+            max_daily_loss=float(os.getenv("QUANTDEV_MAX_DAILY_LOSS", "1000")),
         )
 
 

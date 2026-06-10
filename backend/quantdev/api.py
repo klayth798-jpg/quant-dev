@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Any, Dict
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
@@ -8,20 +9,27 @@ from fastapi.staticfiles import StaticFiles
 
 from quantdev.config import PROJECT_ROOT, settings
 from quantdev.db import database
+from quantdev.integrations.broker import get_broker
 from quantdev.models import (
     AgentResearchRequest,
     BacktestRequest,
     FactorEvaluateRequest,
+    KillSwitchRequest,
     PaperOrderRequest,
     RiskCheckRequest,
     TushareSyncRequest,
 )
 from quantdev.services.agent import research_agent_service
 from quantdev.services.backtest import backtest_service
+from quantdev.services.calendar import trading_calendar_service
 from quantdev.services.execution import paper_execution_service
 from quantdev.services.factors import factor_service
+from quantdev.services.live_guard import live_guard
 from quantdev.services.market import market_data_service
+from quantdev.services.reconciliation import reconciliation_service
+from quantdev.services.readiness import live_readiness_service
 from quantdev.services.risk import risk_service
+from quantdev.services.tradability import tradability_service
 from quantdev.services.tushare_sync import tushare_sync_service
 from quantdev.store import store
 
@@ -62,14 +70,113 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
+    broker_mode = live_guard.resolved_broker_mode()
     return {
         "status": "ok",
         "environment": settings.environment,
         "data_mode": settings.data_mode,
         "database": str(settings.database_path),
-        "live_trading": "disabled",
+        "live_trading": "enabled" if broker_mode == "live" else "disabled",
+        "broker_mode": broker_mode,
+        "kill_switch_active": live_guard.kill_switch_active(),
         "agent_permissions": "read-only",
     }
+
+
+@app.get("/api/live/guard")
+def live_guard_status() -> Dict[str, Any]:
+    return {
+        "broker_mode": live_guard.resolved_broker_mode(),
+        "configured_broker_mode": settings.broker_mode,
+        "live_trading_enabled": settings.live_trading_enabled,
+        "require_order_approval": settings.require_order_approval,
+        "max_live_order_notional": settings.max_live_order_notional,
+        "max_daily_loss": settings.max_daily_loss,
+        "kill_switch": live_guard.kill_switch_status(),
+    }
+
+
+@app.post("/api/live/kill-switch")
+def toggle_kill_switch(request: KillSwitchRequest) -> Dict[str, Any]:
+    reason = request.reason or ("手动激活" if request.active else "手动解除")
+    if request.active:
+        record = live_guard.activate_kill_switch(reason)
+    else:
+        record = live_guard.deactivate_kill_switch(reason)
+    return {"kill_switch": live_guard.kill_switch_status(), "record": record}
+
+
+@app.get("/api/live/broker")
+def live_broker_snapshot() -> Dict[str, Any]:
+    """当前生效 Broker 的健康与账户/持仓/委托/成交查询视图。
+
+    实盘里查询能力比下单更重要：这里把 Broker 的查询接口聚合成一份只读快照。
+    """
+    broker = get_broker()
+    health = broker.health_check()
+    account = broker.get_account()
+    return {
+        "health": asdict(health),
+        "account": asdict(account),
+        "positions": [asdict(item) for item in broker.get_positions()],
+        "orders": [asdict(item) for item in broker.get_orders()],
+        "trades": [asdict(item) for item in broker.get_trades()],
+    }
+
+
+@app.post("/api/live/reconcile")
+def run_reconciliation() -> Dict[str, Any]:
+    """触发一次日终对账：对比本地账本与 Broker 端持仓/现金快照。"""
+    return reconciliation_service.run()
+
+
+@app.get("/api/live/reconciliations")
+def list_reconciliations(limit: int = Query(default=20, ge=1, le=100)) -> Dict[str, Any]:
+    return {"items": store.list_reconciliations(limit=limit)}
+
+
+@app.get("/api/live/reconciliations/{recon_id}")
+def get_reconciliation(recon_id: str) -> Dict[str, Any]:
+    report = store.get_reconciliation(recon_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="未找到该对账记录")
+    return report
+
+
+@app.get("/api/live/market-clock")
+def market_clock() -> Dict[str, Any]:
+    """A股交易时钟：当前是否交易日、是否交易时段、是否允许下单。"""
+    return asdict(trading_calendar_service.market_clock())
+
+
+@app.get("/api/live/tradability/{symbol}")
+def tradability(symbol: str) -> Dict[str, Any]:
+    """标的可交易性：是否停牌、当日涨跌停价与幅度。"""
+    return asdict(tradability_service.evaluate(symbol))
+
+
+@app.get("/api/events")
+def list_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    event_type: str = Query(default=None),
+    aggregate_type: str = Query(default=None),
+    aggregate_id: str = Query(default=None),
+) -> Dict[str, Any]:
+    """全局领域事件日志：按类型 / 聚合维度倒序查询，用于审计与回放。"""
+    return {
+        "items": store.list_domain_events(
+            limit=limit,
+            event_type=event_type,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+        )
+    }
+
+
+@app.get("/api/live/readiness")
+def live_readiness() -> Dict[str, Any]:
+    """实盘路线 5 阶段就绪度自检：逐项校验每个阶段的进入条件。"""
+    return live_readiness_service.evaluate()
 
 
 @app.get("/api/dashboard")
@@ -245,6 +352,14 @@ def submit_paper_order(request: PaperOrderRequest) -> Dict[str, Any]:
         return paper_execution_service.submit(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/paper/orders/{order_id}/events")
+def paper_order_events(order_id: str) -> Dict[str, Any]:
+    events = store.list_order_events(order_id)
+    if not events:
+        raise HTTPException(status_code=404, detail="未找到该订单的事件流")
+    return {"order_id": order_id, "events": events}
 
 
 @app.post("/api/agent/research")

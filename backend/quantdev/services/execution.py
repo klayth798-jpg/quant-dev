@@ -2,7 +2,11 @@ from typing import Any, Dict
 
 from quantdev.db import database
 from quantdev.models import PaperOrderRequest, PositionInput, RiskCheckRequest
+from quantdev.services.calendar import trading_calendar_service
+from quantdev.services.events import EventType, event_bus
+from quantdev.services.live_guard import live_guard
 from quantdev.services.risk import risk_service
+from quantdev.services.tradability import tradability_service
 from quantdev.store import new_id, store, utc_now
 
 
@@ -42,6 +46,21 @@ class PaperExecutionService:
         ).fetchall()
         return {row["symbol"]: float(row["close"]) for row in rows}
 
+    @staticmethod
+    def _sellable_quantity(position, today: str) -> int:
+        """A股 T+1：可卖量 = 总持仓 - 当日买入冻结量。
+
+        冻结仅在 frozen_date == 今日时有效；隔日（含历史持仓）自动解冻。
+        """
+        if not position:
+            return 0
+        total = int(position["quantity"])
+        frozen = int(position["frozen_quantity"] or 0)
+        frozen_date = position["frozen_date"]
+        if frozen_date == today and frozen > 0:
+            return max(total - frozen, 0)
+        return total
+
     def get_account(self) -> Dict[str, Any]:
         self.ensure_account()
         with database.connect() as connection:
@@ -67,6 +86,7 @@ class PaperExecutionService:
                 (self.account_id,),
             ).fetchall()
             prices = self._latest_prices(connection)
+        today = trading_calendar_service.today().isoformat()
         position_items = []
         market_value = 0.0
         unrealized_pnl = 0.0
@@ -77,11 +97,14 @@ class PaperExecutionService:
             pnl = (last_price - item["average_cost"]) * item["quantity"]
             market_value += value
             unrealized_pnl += pnl
+            sellable = self._sellable_quantity(row, today)
             item.update(
                 {
                     "last_price": round(last_price, 4),
                     "market_value": round(value, 2),
                     "unrealized_pnl": round(pnl, 2),
+                    "sellable_quantity": sellable,
+                    "frozen_quantity": int(item["quantity"]) - sellable,
                 }
             )
             position_items.append(item)
@@ -102,6 +125,13 @@ class PaperExecutionService:
 
     def submit(self, request: PaperOrderRequest) -> Dict[str, Any]:
         self.ensure_account()
+        if live_guard.kill_switch_active():
+            status = live_guard.kill_switch_status()
+            raise ValueError(
+                "Kill Switch 已激活，禁止新建委托：{}".format(
+                    status.get("reason") or "未说明原因"
+                )
+            )
         side = request.side.lower()
         order_type = request.order_type.lower()
         if side not in {"buy", "sell"}:
@@ -114,6 +144,7 @@ class PaperExecutionService:
             raise ValueError("限价单必须提供 limit_price")
 
         now = utc_now()
+        today = trading_calendar_service.today().isoformat()
         order_id = new_id("ord")
         risk_request = None
         risk_result = None
@@ -177,6 +208,17 @@ class PaperExecutionService:
             equity = float(account["cash"]) + market_value
             reject_reason = None
 
+            # 停牌 / 涨跌停校验：停牌一律拒单，限价单还需校验是否越过涨跌停板。
+            tradability = tradability_service.evaluate(request.symbol)
+            if tradability.halted:
+                reject_reason = tradability.halt_reason
+            elif order_type == "limit":
+                limit_breach = tradability_service.check_limit_price(
+                    request.symbol, side, request.limit_price
+                )
+                if limit_breach:
+                    reject_reason = limit_breach
+
             commission = max(5.0, gross * self.commission_rate)
             stamp_duty = gross * self.stamp_duty_rate if side == "sell" else 0.0
             fees = commission + stamp_duty
@@ -187,12 +229,20 @@ class PaperExecutionService:
                 """,
                 (self.account_id, request.symbol),
             ).fetchone()
-            if side == "buy" and gross + fees > account["cash"]:
+            if side == "buy" and not reject_reason and gross + fees > account["cash"]:
                 reject_reason = "可用资金不足"
-            if side == "sell" and (
-                not current_position or current_position["quantity"] < request.quantity
-            ):
-                reject_reason = "可卖持仓不足"
+            if side == "sell" and not reject_reason:
+                sellable = self._sellable_quantity(current_position, today)
+                if not current_position or current_position["quantity"] < request.quantity:
+                    reject_reason = "可卖持仓不足"
+                elif sellable < request.quantity:
+                    reject_reason = (
+                        "可卖数量不足（T+1）：当前持仓 {}，其中当日买入冻结 {}，可卖 {}".format(
+                            current_position["quantity"],
+                            current_position["quantity"] - sellable,
+                            sellable,
+                        )
+                    )
             if side == "buy" and not reject_reason and equity > 0:
                 projected_quantities = {
                     row["symbol"]: int(row["quantity"]) for row in positions
@@ -261,6 +311,38 @@ class PaperExecutionService:
                     now,
                 ),
             )
+            # 记录订单生命周期事件流（append-only），便于实盘排查全链路。
+            store.append_order_event(
+                connection,
+                order_id,
+                "ORDER_CREATED",
+                {
+                    "client_order_id": request.client_order_id,
+                    "symbol": request.symbol,
+                    "side": side,
+                    "quantity": request.quantity,
+                    "order_type": order_type,
+                    "limit_price": request.limit_price,
+                },
+            )
+            if risk_result is not None:
+                store.append_order_event(
+                    connection,
+                    order_id,
+                    "RISK_APPROVED" if risk_result["approved"] else "RISK_REJECTED",
+                    {
+                        "approved": risk_result["approved"],
+                        "breaches": [
+                            breach["rule_code"] for breach in risk_result["breaches"]
+                        ],
+                    },
+                )
+            store.append_order_event(
+                connection,
+                order_id,
+                status,
+                {"reject_reason": reject_reason, "marketable": marketable},
+            )
             if status == "FILLED":
                 if side == "buy":
                     old_quantity = current_position["quantity"] if current_position else 0
@@ -269,14 +351,25 @@ class PaperExecutionService:
                     average_cost = (
                         old_quantity * old_cost + gross + fees
                     ) / new_quantity
+                    # T+1：当日买入计入冻结量；隔日的旧冻结自动作废、本日重新累计。
+                    prior_frozen = (
+                        int(current_position["frozen_quantity"] or 0)
+                        if current_position
+                        and current_position["frozen_date"] == today
+                        else 0
+                    )
+                    frozen_quantity = prior_frozen + request.quantity
                     connection.execute(
                         """
                         INSERT INTO paper_positions
-                            (account_id, symbol, quantity, average_cost, updated_at)
-                        VALUES (?, ?, ?, ?, ?)
+                            (account_id, symbol, quantity, average_cost,
+                             frozen_quantity, frozen_date, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(account_id, symbol) DO UPDATE SET
                             quantity = excluded.quantity,
                             average_cost = excluded.average_cost,
+                            frozen_quantity = excluded.frozen_quantity,
+                            frozen_date = excluded.frozen_date,
                             updated_at = excluded.updated_at
                         """,
                         (
@@ -284,6 +377,8 @@ class PaperExecutionService:
                             request.symbol,
                             new_quantity,
                             average_cost,
+                            frozen_quantity,
+                            today,
                             now,
                         ),
                     )
@@ -332,6 +427,16 @@ class PaperExecutionService:
                         now,
                     ),
                 )
+                store.append_order_event(
+                    connection,
+                    order_id,
+                    "FILLED_CONFIRMED",
+                    {
+                        "quantity": request.quantity,
+                        "price": round(fill_price, 4),
+                        "fees": round(fees, 2),
+                    },
+                )
 
         if risk_result and not risk_result["approved"] and risk_request:
             for breach in risk_result["breaches"]:
@@ -347,6 +452,25 @@ class PaperExecutionService:
             resource_type="paper_order",
             resource_id=order_id,
             payload={"status": status, "symbol": request.symbol, "side": side},
+        )
+        if status == "FILLED":
+            event_type = EventType.ORDER_FILLED
+        elif status == "REJECTED":
+            event_type = EventType.ORDER_REJECTED
+        else:
+            event_type = EventType.ORDER_SUBMITTED
+        event_bus.publish(
+            event_type=event_type,
+            aggregate_type="paper_order",
+            aggregate_id=order_id,
+            payload={
+                "status": status,
+                "symbol": request.symbol,
+                "side": side,
+                "quantity": request.quantity,
+                "reject_reason": reject_reason,
+            },
+            actor="local-user",
         )
         return {
             "idempotent": False,

@@ -1,4 +1,5 @@
 import sqlite3
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -224,6 +225,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     symbol TEXT NOT NULL,
     quantity INTEGER NOT NULL,
     average_cost REAL NOT NULL,
+    frozen_quantity INTEGER NOT NULL DEFAULT 0,
+    frozen_date TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (account_id, symbol),
     FOREIGN KEY (account_id) REFERENCES paper_accounts(account_id),
@@ -268,10 +271,82 @@ CREATE TABLE IF NOT EXISTS audit_log (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS system_flags (
+    flag TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    reason TEXT,
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS order_events (
+    event_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (order_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, seq);
+
+CREATE TABLE IF NOT EXISTS reconciliations (
+    recon_id TEXT PRIMARY KEY,
+    broker_mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cash_diff REAL NOT NULL,
+    position_break_count INTEGER NOT NULL,
+    breaks_json TEXT NOT NULL,
+    local_json TEXT NOT NULL,
+    broker_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reconciliations_created ON reconciliations(created_at);
+
+CREATE TABLE IF NOT EXISTS domain_events (
+    event_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_events_seq ON domain_events(seq);
+CREATE INDEX IF NOT EXISTS idx_domain_events_type ON domain_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_domain_events_aggregate
+ON domain_events(aggregate_type, aggregate_id);
 """
 
 
-class Database:
+class DatabaseBackend(ABC):
+    """数据库后端抽象：定义连接 / 事务 / 迁移三件套。
+
+    当前默认实现为 SQLite。引入该抽象是为 PostgreSQL 迁移预留可插拔扩展点——
+    届时只需新增一个实现并在工厂里挂载，store/service 层无需改动。
+    """
+
+    @abstractmethod
+    def connect(self):  # pragma: no cover - 由具体后端实现
+        raise NotImplementedError
+
+    @abstractmethod
+    def transaction(self):  # pragma: no cover
+        raise NotImplementedError
+
+    @abstractmethod
+    def migrate(self) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+
+class SqliteDatabase(DatabaseBackend):
+    backend = "sqlite"
+
     def __init__(self, path: Path = settings.database_path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -297,6 +372,50 @@ class Database:
     def migrate(self) -> None:
         with self.transaction() as connection:
             connection.executescript(SCHEMA)
+            self._add_missing_columns(connection)
+
+    @staticmethod
+    def _add_missing_columns(connection: sqlite3.Connection) -> None:
+        """对已存在的表幂等补列（IF NOT EXISTS 的 CREATE 不会给旧表加列）。"""
+        expected = {
+            "paper_positions": {
+                "frozen_quantity": "INTEGER NOT NULL DEFAULT 0",
+                "frozen_date": "TEXT",
+            },
+        }
+        for table, columns in expected.items():
+            existing = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info({})".format(table)
+                ).fetchall()
+            }
+            for column, ddl in columns.items():
+                if column not in existing:
+                    connection.execute(
+                        "ALTER TABLE {} ADD COLUMN {} {}".format(table, column, ddl)
+                    )
 
 
-database = Database()
+# 向后兼容别名：历史代码以 Database 引用 SQLite 实现。
+Database = SqliteDatabase
+
+
+def create_database() -> DatabaseBackend:
+    """按配置选择数据库后端。
+
+    默认 sqlite；postgres 作为预留扩展点，未实现具体驱动前显式报错，
+    避免误以为已落地 PG 而把真实资金账本写到不存在的库上。
+    """
+    backend = settings.database_backend
+    if backend in ("sqlite", ""):
+        return SqliteDatabase()
+    if backend in ("postgres", "postgresql"):
+        raise NotImplementedError(
+            "PostgreSQL 后端尚未实现：请保持 QUANTDEV_DATABASE_BACKEND=sqlite，"
+            "或先实现 PostgresDatabase 后端再切换。"
+        )
+    raise ValueError("未知的数据库后端：{}".format(backend))
+
+
+database = create_database()

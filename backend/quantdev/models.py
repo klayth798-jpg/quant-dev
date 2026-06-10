@@ -66,3 +66,8 @@ class TushareSyncRequest(BaseModel):
 class ApiMessage(BaseModel):
     message: str
     data: Dict[str, Any] = {}
+
+
+class KillSwitchRequest(BaseModel):
+    active: bool
+    reason: str = Field(default="", max_length=200)
