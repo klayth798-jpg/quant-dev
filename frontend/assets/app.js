@@ -8,6 +8,12 @@ const state = {
   dataStatus: null,
   indices: [],
   paperAccount: null,
+  liveGuard: null,
+  marketClock: null,
+  readiness: null,
+  strategies: [],
+  strategyRuns: [],
+  activeStrategyRun: null,
   activeBacktest: null,
 };
 
@@ -18,6 +24,7 @@ const viewMeta = {
   backtest: ["RESEARCH / BACKTEST", "策略回测"],
   risk: ["PORTFOLIO / RISK", "风险检查"],
   paper: ["EXECUTION / PAPER", "模拟交易"],
+  strategy: ["EXECUTION / STRATEGY", "策略运行"],
   agent: ["RESEARCH / AGENT", "研究 Agent"],
 };
 
@@ -55,8 +62,15 @@ function showToast(message, type = "info") {
 }
 
 async function api(path, options = {}) {
+  const adminKey = window.localStorage.getItem("quantdevAdminKey") || "";
+  const operator = window.localStorage.getItem("quantdevOperator") || "local-admin";
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(adminKey ? { "X-Admin-Key": adminKey } : {}),
+      "X-Operator": operator,
+      ...(options.headers || {}),
+    },
     ...options,
   });
   const payload = await response.json().catch(() => ({}));
@@ -64,6 +78,18 @@ async function api(path, options = {}) {
     throw new Error(payload.detail || "请求失败");
   }
   return payload;
+}
+
+async function waitForTask(taskId, message = "任务执行中") {
+  for (;;) {
+    const task = await api(`/api/tasks/${taskId}`);
+    if (task.status === "COMPLETED") return task.result;
+    if (task.status === "FAILED") {
+      throw new Error(task.error_message || "任务执行失败");
+    }
+    showToast(`${message}，第 ${task.attempts || 0} 次尝试`);
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+  }
 }
 
 async function loadCoreData() {
@@ -76,6 +102,11 @@ async function loadCoreData() {
     paperAccount,
     dataStatus,
     indices,
+    liveGuard,
+    marketClock,
+    readiness,
+    strategies,
+    strategyRuns,
   ] = await Promise.all([
     api("/api/dashboard"),
     api("/api/factors"),
@@ -85,6 +116,11 @@ async function loadCoreData() {
     api("/api/paper/account"),
     api("/api/data/status"),
     api("/api/data/indices"),
+    api("/api/live/guard"),
+    api("/api/live/market-clock"),
+    api("/api/live/readiness"),
+    api("/api/strategies"),
+    api("/api/strategies/runs"),
   ]);
   state.dashboard = dashboard;
   state.factors = factors.items;
@@ -94,6 +130,11 @@ async function loadCoreData() {
   state.paperAccount = paperAccount;
   state.dataStatus = dataStatus;
   state.indices = indices.items;
+  state.liveGuard = liveGuard;
+  state.marketClock = marketClock;
+  state.readiness = readiness;
+  state.strategies = strategies.items;
+  state.strategyRuns = strategyRuns.items;
   document.querySelector("#snapshot-label").textContent =
     dashboard.snapshot_id || "暂无数据快照";
 }
@@ -549,13 +590,14 @@ async function evaluateFactor(button) {
   try {
     const forwardDays = Number(document.querySelector("#factor-forward-days").value);
     const neutralize = document.querySelector("#factor-neutralize").value === "true";
-    const result = await api(`/api/factors/${button.dataset.factor}/evaluate`, {
+    const task = await api(`/api/factors/${button.dataset.factor}/evaluate`, {
       method: "POST",
       body: JSON.stringify({
         forward_days: forwardDays,
         neutralize,
       }),
     });
+    const result = await waitForTask(task.task_id, "因子评估中");
     showToast(`评估完成，IC ${number(result.metrics.ic_mean, 4)}`);
     await loadCoreData();
     renderFactors();
@@ -660,10 +702,12 @@ async function runBacktest(event) {
   button.disabled = true;
   button.textContent = "正在回测";
   try {
-    const result = await api("/api/backtests", {
+    const task = await api("/api/backtests", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    const completed = await waitForTask(task.task_id, "策略回测中");
+    const result = await api(`/api/backtests/${completed.run_id}`);
     state.activeBacktest = result;
     document.querySelector("#backtest-result").innerHTML = backtestResultMarkup(result);
     drawLineChart(document.querySelector("#backtest-chart"), result.equity_curve, "equity", "benchmark");
@@ -789,9 +833,9 @@ function renderPaper() {
   workspace.innerHTML = `
     <div class="metric-grid">
       ${metric("账户净值", `¥${number(account.equity)}`, account.name)}
-      ${metric("可用现金", `¥${number(account.cash)}`, "即时成交模拟")}
+      ${metric("可用现金", `¥${number(account.available_cash)}`, `冻结 ¥${number(account.reserved_cash)}`)}
       ${metric("持仓市值", `¥${number(account.market_value)}`, `${account.positions.length} 个持仓`)}
-      ${metric("累计收益", percent(account.total_return), "初始资金 ¥1,000,000", account.total_return >= 0 ? "positive" : "negative")}
+      ${metric("当日盈亏", `¥${number(account.daily_pnl)}`, `限额 ¥${number(account.daily_loss_limit)}`, account.daily_pnl >= 0 ? "positive" : "negative")}
     </div>
     <div class="workspace-grid">
       <section class="panel">
@@ -830,6 +874,9 @@ function renderPaper() {
       ${paperOrdersTable(account.orders)}
     </section>`;
   document.querySelector("#paper-order-form").addEventListener("submit", submitPaperOrder);
+  document.querySelectorAll("[data-cancel-order]").forEach((button) => {
+    button.addEventListener("click", () => cancelPaperOrder(button.dataset.cancelOrder));
+  });
   document.querySelector("#paper-order-type").addEventListener("change", (event) => {
     const limitInput = document.querySelector("#paper-limit-price");
     limitInput.disabled = event.currentTarget.value !== "limit";
@@ -841,10 +888,10 @@ function renderPaper() {
 function paperPositionsTable(items) {
   if (!items.length) return '<div class="empty-state">当前没有模拟持仓</div>';
   return `<div class="table-shell"><table>
-    <thead><tr><th>标的</th><th>数量</th><th>平均成本</th><th>最新价</th><th>市值</th><th>浮动盈亏</th></tr></thead>
+    <thead><tr><th>标的</th><th>数量</th><th>可卖</th><th>平均成本</th><th>最新价</th><th>市值</th><th>浮动盈亏</th></tr></thead>
     <tbody>${items.map((item) => `<tr>
       <td><strong>${escapeHtml(item.name)}</strong><div class="subtle mono">${escapeHtml(item.symbol)}</div></td>
-      <td>${item.quantity}</td><td>${number(item.average_cost, 4)}</td><td>${number(item.last_price, 4)}</td>
+      <td>${item.quantity}</td><td>${item.sellable_quantity}</td><td>${number(item.average_cost, 4)}</td><td>${number(item.last_price, 4)}</td>
       <td>¥${number(item.market_value)}</td><td class="${item.unrealized_pnl >= 0 ? "positive" : "negative"}">¥${number(item.unrealized_pnl)}</td>
     </tr>`).join("")}</tbody>
   </table></div>`;
@@ -853,14 +900,336 @@ function paperPositionsTable(items) {
 function paperOrdersTable(items) {
   if (!items.length) return '<div class="empty-state">暂无模拟委托</div>';
   return `<div class="table-shell"><table>
-    <thead><tr><th>委托ID</th><th>标的</th><th>方向</th><th>数量</th><th>状态</th><th>时间</th></tr></thead>
+    <thead><tr><th>委托ID</th><th>标的</th><th>方向</th><th>数量</th><th>状态</th><th>时间</th><th>操作</th></tr></thead>
     <tbody>${items.map((item) => `<tr>
       <td class="mono">${escapeHtml(item.client_order_id)}</td><td>${escapeHtml(item.symbol)}</td>
       <td>${item.side === "buy" ? "买入" : "卖出"}</td><td>${item.quantity}</td>
       <td><span class="badge ${item.status === "REJECTED" ? "danger" : ""}">${escapeHtml(item.status)}</span></td>
       <td>${escapeHtml(item.created_at.slice(0, 16).replace("T", " "))}</td>
+      <td>${["OPEN", "PARTIALLY_FILLED", "UNKNOWN"].includes(item.status) ? `<button class="button secondary" data-cancel-order="${escapeHtml(item.order_id)}">撤单</button>` : "—"}</td>
     </tr>`).join("")}</tbody>
   </table></div>`;
+}
+
+async function cancelPaperOrder(orderId) {
+  try {
+    const result = await api(`/api/paper/orders/${encodeURIComponent(orderId)}/cancel`, {
+      method: "POST",
+    });
+    state.paperAccount = result.account;
+    renderPaper();
+    showToast(`订单状态：${result.order.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function renderStrategy() {
+  const guard = state.liveGuard;
+  const clock = state.marketClock;
+  const keyConfigured = Boolean(window.localStorage.getItem("quantdevAdminKey"));
+  workspace.innerHTML = `
+    <div class="metric-grid">
+      ${metric("交易时钟", clock.can_trade ? "可交易" : "关闭", clock.session, clock.can_trade ? "positive" : "negative")}
+      ${metric("Broker 模式", guard.broker_mode, guard.live_trading_enabled ? "实盘总开关开启" : "实盘总开关关闭")}
+      ${metric("Kill Switch", guard.kill_switch.active ? "ACTIVE" : "OFF", guard.kill_switch.reason || "运行正常", guard.kill_switch.active ? "negative" : "positive")}
+      ${metric("当前阶段", state.readiness.current_stage, state.readiness.all_ready ? "全部就绪" : "仍有前置检查")}
+    </div>
+    <div class="workspace-grid">
+      <section class="panel">
+        <div class="panel-header"><div><h2>策略配置</h2><p>因子信号生成目标仓位与幂等订单意图</p></div></div>
+        <form id="strategy-form">
+          <div class="form-grid">
+            <div class="field span-2"><label for="strategy-name">名称</label><input id="strategy-name" value="多因子模拟实盘" required /></div>
+            <div class="field span-2"><label for="strategy-factor">因子</label><select id="strategy-factor">${factorOptions()}</select></div>
+            <div class="field"><label for="strategy-topn">持仓数</label><input id="strategy-topn" type="number" value="5" min="1" max="20" /></div>
+            <div class="field"><label for="strategy-cycle">调仓周期</label><input id="strategy-cycle" type="number" value="5" min="1" max="60" /></div>
+            <div class="field"><label for="strategy-notional">单票目标金额</label><input id="strategy-notional" type="number" value="5000" min="100" step="100" /></div>
+            <div class="field"><label for="strategy-enabled">创建后状态</label><select id="strategy-enabled"><option value="false">停用</option><option value="true">启用</option></select></div>
+          </div>
+          <div class="form-actions"><button class="button" type="submit">创建策略</button></div>
+        </form>
+      </section>
+      <aside class="panel">
+        <div class="panel-header"><div><h2>操作认证</h2><p>写操作使用 X-Admin-Key</p></div></div>
+        <div class="field"><label for="admin-key">管理员密钥</label><input id="admin-key" type="password" value="" placeholder="${keyConfigured ? "已保存在本机浏览器" : "未配置"}" /></div>
+        <div class="form-actions">
+          <button class="button secondary" id="save-admin-key" type="button">保存密钥</button>
+          <button class="button ${guard.kill_switch.active ? "" : "danger"}" id="toggle-kill" type="button">${guard.kill_switch.active ? "解除熔断" : "立即熔断"}</button>
+        </div>
+      </aside>
+    </div>
+    <section class="panel">
+      <div class="panel-header"><div><h2>已配置策略</h2><p>自动运行前先保持停用并手动验证</p></div></div>
+      ${strategyTable(state.strategies)}
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>最近运行</h2><p>信号日期、运行状态与失败原因</p></div></div>
+      ${strategyRunsTable(state.strategyRuns)}
+    </section>
+    <section class="panel" id="strategy-intent-panel">
+      <div class="panel-header"><div><h2>订单意图</h2><p>选择一次运行查看审批与执行状态</p></div></div>
+      ${state.activeStrategyRun ? strategyIntentTable(state.activeStrategyRun) : '<div class="empty-state">尚未选择策略运行</div>'}
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>实盘就绪度</h2><p>按阶段逐项放行</p></div></div>
+      <div class="status-list">${state.readiness.stages.map((stage) => `
+        <div class="status-row"><span>${escapeHtml(stage.title)}</span><span class="badge ${stage.ready ? "" : "danger"}">${stage.ready ? "READY" : "BLOCKED"}</span></div>
+      `).join("")}</div>
+    </section>`;
+  document.querySelector("#strategy-form").addEventListener("submit", createStrategy);
+  document.querySelector("#save-admin-key").addEventListener("click", saveAdminKey);
+  document.querySelector("#toggle-kill").addEventListener("click", toggleKillSwitch);
+  document.querySelectorAll("[data-run-strategy]").forEach((button) => {
+    button.addEventListener("click", () => runStrategy(button.dataset.runStrategy));
+  });
+  document.querySelectorAll("[data-enable-strategy]").forEach((button) => {
+    button.addEventListener("click", () => setStrategyEnabled(
+      button.dataset.enableStrategy,
+      button.dataset.enabled !== "true",
+    ));
+  });
+  bindStrategyRunActions();
+}
+
+function strategyTable(items) {
+  if (!items.length) return '<div class="empty-state">暂无策略配置</div>';
+  return `<div class="table-shell"><table>
+    <thead><tr><th>名称</th><th>因子</th><th>持仓数</th><th>周期</th><th>单票金额</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>${items.map((item) => `<tr>
+      <td><strong>${escapeHtml(item.name)}</strong><div class="subtle mono">${escapeHtml(item.strategy_id)}</div></td>
+      <td>${escapeHtml(item.factor_id)}</td><td>${item.top_n}</td><td>${item.rebalance_days} 日</td><td>¥${number(item.max_order_notional)}</td>
+      <td><span class="badge ${item.enabled ? "" : "danger"}">${item.enabled ? "ENABLED" : "DISABLED"}</span></td>
+      <td><button class="button secondary" data-run-strategy="${escapeHtml(item.strategy_id)}">运行</button> <button class="button secondary" data-enable-strategy="${escapeHtml(item.strategy_id)}" data-enabled="${item.enabled}">${item.enabled ? "停用" : "启用"}</button></td>
+    </tr>`).join("")}</tbody>
+  </table></div>`;
+}
+
+function strategyRunsTable(items) {
+  if (!items.length) return '<div class="empty-state">暂无策略运行记录</div>';
+  return `<div class="table-shell"><table>
+    <thead><tr><th>运行ID</th><th>策略</th><th>交易日</th><th>信号日</th><th>状态</th><th>错误</th><th>操作</th></tr></thead>
+    <tbody>${items.map((item) => `<tr>
+      <td class="mono">${escapeHtml(item.run_id)}</td><td class="mono">${escapeHtml(item.strategy_id)}</td>
+      <td>${escapeHtml(item.trade_date)}</td><td>${escapeHtml(item.signal_date || "—")}</td>
+      <td><span class="badge ${["FAILED", "PARTIAL"].includes(item.status) ? "danger" : ""}">${escapeHtml(item.status)}</span></td>
+      <td>${escapeHtml(item.error_message || "—")}</td>
+      <td><button class="button secondary" data-view-run="${escapeHtml(item.run_id)}">查看意图</button></td>
+    </tr>`).join("")}</tbody>
+  </table></div>`;
+}
+
+function strategyIntentTable(run) {
+  if (!run.intents.length) return '<div class="empty-state">本次运行无需调仓</div>';
+  return `<div class="table-shell"><table>
+    <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>模式</th><th>审批</th><th>状态</th><th>订单号</th><th>操作</th></tr></thead>
+    <tbody>${run.intents.map((item) => `<tr>
+      <td class="mono">${escapeHtml(item.symbol)}</td>
+      <td>${item.side === "buy" ? "买入" : "卖出"}</td>
+      <td>${item.quantity}</td>
+      <td>${escapeHtml(item.execution_mode)}</td>
+      <td>${escapeHtml(item.approval_status)}</td>
+      <td><span class="badge ${["REJECTED", "BLOCKED", "ERROR"].includes(item.status) ? "danger" : ""}">${escapeHtml(item.status)}</span></td>
+      <td class="mono">${escapeHtml(item.broker_order_id || item.paper_order_id || "—")}</td>
+      <td>${intentActions(item)}</td>
+    </tr>`).join("")}</tbody>
+  </table></div>`;
+}
+
+function intentActions(item) {
+  if (item.execution_mode !== "live") return "—";
+  const actions = [];
+  if (["PENDING_APPROVAL", "BLOCKED"].includes(item.status)) {
+    actions.push(`<button class="button secondary" data-approve-intent="${escapeHtml(item.intent_id)}">审批</button>`);
+  }
+  if (item.approval_status === "APPROVED" && ["PENDING_APPROVAL", "APPROVED", "BLOCKED"].includes(item.status)) {
+    actions.push(`<button class="button" data-submit-intent="${escapeHtml(item.intent_id)}">提交</button>`);
+  }
+  if (!["FILLED", "CANCELLED", "REJECTED"].includes(item.status)) {
+    actions.push(`<button class="button danger" data-reject-intent="${escapeHtml(item.intent_id)}">拒绝</button>`);
+  }
+  if (item.live_order_id && ["OPEN", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN"].includes(item.status)) {
+    actions.push(`<button class="button secondary" data-cancel-live="${escapeHtml(item.live_order_id)}">撤单</button>`);
+  }
+  return actions.join(" ") || "—";
+}
+
+function bindStrategyRunActions() {
+  document.querySelectorAll("[data-view-run]").forEach((button) => {
+    button.addEventListener("click", () => loadStrategyRun(button.dataset.viewRun));
+  });
+  document.querySelectorAll("[data-approve-intent]").forEach((button) => {
+    button.addEventListener("click", () => approveIntent(button.dataset.approveIntent));
+  });
+  document.querySelectorAll("[data-submit-intent]").forEach((button) => {
+    button.addEventListener("click", () => submitIntent(button.dataset.submitIntent));
+  });
+  document.querySelectorAll("[data-reject-intent]").forEach((button) => {
+    button.addEventListener("click", () => rejectIntent(button.dataset.rejectIntent));
+  });
+  document.querySelectorAll("[data-cancel-live]").forEach((button) => {
+    button.addEventListener("click", () => cancelLiveOrder(button.dataset.cancelLive));
+  });
+}
+
+async function loadStrategyRun(runId) {
+  try {
+    state.activeStrategyRun = await api(`/api/strategies/runs/${encodeURIComponent(runId)}`);
+    renderStrategy();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function refreshActiveStrategyRun() {
+  if (!state.activeStrategyRun) return;
+  state.activeStrategyRun = await api(`/api/strategies/runs/${encodeURIComponent(state.activeStrategyRun.run_id)}`);
+}
+
+async function approveIntent(intentId) {
+  try {
+    await api(`/api/strategies/intents/${encodeURIComponent(intentId)}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ reason: "前端人工核对通过" }),
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast("订单意图已审批，请在有效期内提交");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function submitIntent(intentId) {
+  try {
+    const result = await api(`/api/strategies/intents/${encodeURIComponent(intentId)}/submit`, {
+      method: "POST",
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast(`券商订单状态：${result.order.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function rejectIntent(intentId) {
+  if (!window.confirm("确认拒绝该订单意图？")) return;
+  try {
+    await api(`/api/strategies/intents/${encodeURIComponent(intentId)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ reason: "前端人工拒绝" }),
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast("订单意图已拒绝");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function cancelLiveOrder(orderId) {
+  try {
+    const result = await api(`/api/live/orders/${encodeURIComponent(orderId)}/cancel`, {
+      method: "POST",
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast(`撤单状态：${result.order.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function refreshStrategyData() {
+  const [guard, readiness, strategies, runs, clock] = await Promise.all([
+    api("/api/live/guard"),
+    api("/api/live/readiness"),
+    api("/api/strategies"),
+    api("/api/strategies/runs"),
+    api("/api/live/market-clock"),
+  ]);
+  state.liveGuard = guard;
+  state.readiness = readiness;
+  state.strategies = strategies.items;
+  state.strategyRuns = runs.items;
+  state.marketClock = clock;
+}
+
+function saveAdminKey() {
+  const value = document.querySelector("#admin-key").value.trim();
+  if (value) window.localStorage.setItem("quantdevAdminKey", value);
+  else window.localStorage.removeItem("quantdevAdminKey");
+  showToast(value ? "管理员密钥已保存在本机浏览器" : "管理员密钥已清除");
+  renderStrategy();
+}
+
+async function createStrategy(event) {
+  event.preventDefault();
+  try {
+    await api("/api/strategies", {
+      method: "POST",
+      body: JSON.stringify({
+        name: document.querySelector("#strategy-name").value,
+        factor_id: document.querySelector("#strategy-factor").value,
+        top_n: Number(document.querySelector("#strategy-topn").value),
+        rebalance_days: Number(document.querySelector("#strategy-cycle").value),
+        max_order_notional: Number(document.querySelector("#strategy-notional").value),
+        enabled: document.querySelector("#strategy-enabled").value === "true",
+      }),
+    });
+    await refreshStrategyData();
+    renderStrategy();
+    showToast("策略已创建");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function runStrategy(strategyId) {
+  try {
+    const result = await api("/api/strategies/run", {
+      method: "POST",
+      body: JSON.stringify({ strategy_id: strategyId, force: false }),
+    });
+    await loadCoreData();
+    renderStrategy();
+    showToast(`策略运行状态：${result.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function setStrategyEnabled(strategyId, enabled) {
+  try {
+    await api(`/api/strategies/${encodeURIComponent(strategyId)}/enabled`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    await refreshStrategyData();
+    renderStrategy();
+    showToast(enabled ? "策略已启用" : "策略已停用");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function toggleKillSwitch() {
+  const active = !state.liveGuard.kill_switch.active;
+  try {
+    await api("/api/live/kill-switch", {
+      method: "POST",
+      body: JSON.stringify({
+        active,
+        reason: active ? "前端手动熔断" : "前端人工确认后解除",
+      }),
+    });
+    await refreshStrategyData();
+    renderStrategy();
+    showToast(active ? "Kill Switch 已激活" : "Kill Switch 已解除");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
 }
 
 async function submitPaperOrder(event) {
@@ -931,6 +1300,10 @@ function render() {
   const [eyebrow, title] = viewMeta[state.view];
   document.querySelector("#page-eyebrow").textContent = eyebrow;
   document.querySelector("#page-title").textContent = title;
+  if (!state.dashboard) {
+    workspace.innerHTML = '<div class="empty-state">正在初始化研究环境...</div>';
+    return;
+  }
   const renderers = {
     overview: renderOverview,
     data: renderData,
@@ -938,6 +1311,7 @@ function render() {
     backtest: renderBacktest,
     risk: renderRisk,
     paper: renderPaper,
+    strategy: renderStrategy,
     agent: renderAgent,
   };
   renderers[state.view]();

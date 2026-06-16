@@ -20,7 +20,10 @@ def test_factor_evaluation_is_reproducible():
     second = factor_service.evaluate("momentum_20", forward_days=5)
 
     assert first["metrics"] == second["metrics"]
-    assert first["metrics"]["observations"] > 1000
+    # 非重叠采样后观测数约为按日采样的 1/forward_days（统计上更诚实）。
+    assert first["metrics"]["observations"] > 400
+    # 相邻采样日间隔 >= forward_days 个交易日。
+    assert first["metrics"]["trading_days"] <= second["metrics"]["observations"]
     assert first["snapshot_id"] == "demo-cn-equity-20260605-v1"
 
 

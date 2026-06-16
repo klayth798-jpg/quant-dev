@@ -1,8 +1,10 @@
+import re
 import sqlite3
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator, Iterable, Optional, Sequence
 
 from quantdev.config import settings
 
@@ -194,6 +196,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     name TEXT NOT NULL,
     factor_id TEXT NOT NULL,
     snapshot_id TEXT NOT NULL,
+    manifest_id TEXT,
     config_json TEXT NOT NULL,
     metrics_json TEXT NOT NULL,
     equity_json TEXT NOT NULL,
@@ -215,6 +218,7 @@ CREATE TABLE IF NOT EXISTS paper_accounts (
     account_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     cash REAL NOT NULL,
+    reserved_cash REAL NOT NULL DEFAULT 0,
     initial_cash REAL NOT NULL,
     status TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -227,6 +231,7 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     average_cost REAL NOT NULL,
     frozen_quantity INTEGER NOT NULL DEFAULT 0,
     frozen_date TEXT,
+    reserved_quantity INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (account_id, symbol),
     FOREIGN KEY (account_id) REFERENCES paper_accounts(account_id),
@@ -243,7 +248,18 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     order_type TEXT NOT NULL,
     limit_price REAL,
     status TEXT NOT NULL,
+    filled_quantity INTEGER NOT NULL DEFAULT 0,
+    average_fill_price REAL,
+    reserved_cash REAL NOT NULL DEFAULT 0,
+    reserved_quantity INTEGER NOT NULL DEFAULT 0,
+    broker_order_id TEXT,
+    last_error TEXT,
+    strategy_run_id TEXT,
+    order_intent_id TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
     reject_reason TEXT,
+    submitted_at TEXT,
+    completed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (account_id) REFERENCES paper_accounts(account_id),
@@ -321,34 +337,416 @@ CREATE INDEX IF NOT EXISTS idx_domain_events_seq ON domain_events(seq);
 CREATE INDEX IF NOT EXISTS idx_domain_events_type ON domain_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_domain_events_aggregate
 ON domain_events(aggregate_type, aggregate_id);
+
+CREATE TABLE IF NOT EXISTS market_quotes (
+    symbol TEXT PRIMARY KEY,
+    price REAL NOT NULL,
+    bid REAL,
+    ask REAL,
+    quote_time TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    FOREIGN KEY (symbol) REFERENCES instruments(symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_quotes_time ON market_quotes(quote_time);
+
+CREATE TABLE IF NOT EXISTS market_quote_history (
+    quote_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    price REAL NOT NULL,
+    bid REAL,
+    ask REAL,
+    quote_time TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    FOREIGN KEY (symbol) REFERENCES instruments(symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_quote_history_symbol_time
+ON market_quote_history(symbol, quote_time);
+
+CREATE TABLE IF NOT EXISTS dataset_manifests (
+    manifest_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    sync_run_id TEXT,
+    max_trade_date TEXT,
+    row_count INTEGER NOT NULL,
+    instrument_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dataset_manifests_snapshot_created
+ON dataset_manifests(snapshot_id, created_at);
+
+CREATE TABLE IF NOT EXISTS account_daily_snapshots (
+    account_id TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    start_equity REAL NOT NULL,
+    current_equity REAL NOT NULL,
+    daily_pnl REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, trade_date),
+    FOREIGN KEY (account_id) REFERENCES paper_accounts(account_id)
+);
+
+CREATE TABLE IF NOT EXISTS strategy_configs (
+    strategy_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    factor_id TEXT NOT NULL,
+    top_n INTEGER NOT NULL,
+    rebalance_days INTEGER NOT NULL,
+    universe_json TEXT NOT NULL,
+    neutralize INTEGER NOT NULL DEFAULT 0,
+    order_type TEXT NOT NULL,
+    max_order_notional REAL NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_runs (
+    run_id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    signal_date TEXT,
+    snapshot_id TEXT,
+    manifest_id TEXT,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE (strategy_id, trade_date),
+    FOREIGN KEY (strategy_id) REFERENCES strategy_configs(strategy_id)
+);
+
+CREATE TABLE IF NOT EXISTS strategy_targets (
+    run_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    score REAL NOT NULL,
+    target_weight REAL NOT NULL,
+    target_quantity INTEGER NOT NULL,
+    PRIMARY KEY (run_id, symbol),
+    FOREIGN KEY (run_id) REFERENCES strategy_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS order_intents (
+    intent_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    order_type TEXT NOT NULL,
+    limit_price REAL,
+    status TEXT NOT NULL,
+    paper_order_id TEXT,
+    live_order_id TEXT,
+    broker_order_id TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'paper',
+    approval_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED',
+    request_hash TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES strategy_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_intents_run ON order_intents(run_id);
+
+CREATE TABLE IF NOT EXISTS order_approvals (
+    approval_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    reason TEXT,
+    approved_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (intent_id) REFERENCES order_intents(intent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_approvals_intent
+ON order_approvals(intent_id, created_at);
+
+CREATE TABLE IF NOT EXISTS live_orders (
+    order_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL UNIQUE,
+    client_order_id TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    order_type TEXT NOT NULL,
+    limit_price REAL,
+    request_hash TEXT NOT NULL,
+    approval_id TEXT,
+    broker_order_id TEXT UNIQUE,
+    status TEXT NOT NULL,
+    filled_quantity INTEGER NOT NULL DEFAULT 0,
+    average_fill_price REAL,
+    last_error TEXT,
+    submitted_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (intent_id) REFERENCES order_intents(intent_id),
+    FOREIGN KEY (approval_id) REFERENCES order_approvals(approval_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_orders_status ON live_orders(status);
+
+CREATE TABLE IF NOT EXISTS live_trades (
+    trade_id TEXT PRIMARY KEY,
+    broker_trade_id TEXT NOT NULL UNIQUE,
+    order_id TEXT NOT NULL,
+    broker_order_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    fees REAL NOT NULL DEFAULT 0,
+    traded_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES live_orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS live_account_state (
+    account_id TEXT PRIMARY KEY,
+    cash REAL NOT NULL,
+    initial_cash REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS live_account_daily_snapshots (
+    account_id TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    start_equity REAL NOT NULL,
+    current_equity REAL NOT NULL,
+    daily_pnl REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, trade_date)
+);
+
+CREATE TABLE IF NOT EXISTS live_positions (
+    account_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    sellable_quantity INTEGER NOT NULL DEFAULT 0,
+    average_cost REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, symbol)
+);
+
+CREATE TABLE IF NOT EXISTS system_leases (
+    lease_key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mock_broker_orders (
+    broker_order_id TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL UNIQUE,
+    scenario TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    order_type TEXT NOT NULL,
+    limit_price REAL,
+    filled_quantity INTEGER NOT NULL DEFAULT 0,
+    average_fill_price REAL,
+    status TEXT NOT NULL,
+    message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mock_broker_trades (
+    trade_id TEXT PRIMARY KEY,
+    broker_order_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    traded_at TEXT NOT NULL,
+    FOREIGN KEY (broker_order_id) REFERENCES mock_broker_orders(broker_order_id)
+);
+
+CREATE TABLE IF NOT EXISTS mock_broker_accounts (
+    account_id TEXT PRIMARY KEY,
+    cash REAL NOT NULL,
+    initial_cash REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mock_broker_positions (
+    account_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    average_cost REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, symbol)
+);
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+    verification_id TEXT PRIMARY KEY,
+    check_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_runs_type_created
+ON verification_runs(check_type, created_at);
 """
+
+TASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_jobs (
+    task_id TEXT PRIMARY KEY,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    result_json TEXT,
+    error_message TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    worker_id TEXT,
+    created_at TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_jobs_status_created
+ON task_jobs(status, created_at);
+"""
+
+MIGRATIONS = (
+    (1, SCHEMA),
+    (2, TASK_SCHEMA),
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _postgres_script(script: str) -> str:
+    without_pragmas = "\n".join(
+        line for line in script.splitlines() if not line.strip().upper().startswith("PRAGMA ")
+    )
+    return re.sub(r"\bREAL\b", "DOUBLE PRECISION", without_pragmas)
+
+
+def _qmark_to_postgres(sql: str) -> str:
+    """Convert DB-API qmark placeholders without touching quoted SQL text."""
+    result = []
+    quote: Optional[str] = None
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if quote:
+            result.append(character)
+            if character == quote:
+                if index + 1 < len(sql) and sql[index + 1] == quote:
+                    result.append(sql[index + 1])
+                    index += 1
+                else:
+                    quote = None
+        elif character in ("'", '"'):
+            quote = character
+            result.append(character)
+        elif character == "?":
+            result.append("%s")
+        else:
+            result.append(character)
+        index += 1
+    return "".join(result)
+
+
+class PostgresConnection:
+    """Small compatibility wrapper preserving the store layer's qmark SQL."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            if exc_type is None:
+                self._connection.commit()
+            else:
+                self._connection.rollback()
+        finally:
+            self._connection.close()
+
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None):
+        converted = _qmark_to_postgres(sql)
+        if params is None:
+            return self._connection.execute(converted)
+        return self._connection.execute(converted, tuple(params))
+
+    def executemany(self, sql: str, params: Iterable[Sequence[Any]]):
+        return self._connection.executemany(
+            _qmark_to_postgres(sql),
+            params,
+        )
+
+    def executescript(self, script: str) -> None:
+        for statement in _postgres_script(script).split(";"):
+            if statement.strip():
+                self._connection.execute(statement)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 class DatabaseBackend(ABC):
-    """数据库后端抽象：定义连接 / 事务 / 迁移三件套。
-
-    当前默认实现为 SQLite。引入该抽象是为 PostgreSQL 迁移预留可插拔扩展点——
-    届时只需新增一个实现并在工厂里挂载，store/service 层无需改动。
-    """
+    """数据库后端抽象：统一连接、事务、迁移和健康检查。"""
 
     @abstractmethod
     def connect(self):  # pragma: no cover - 由具体后端实现
         raise NotImplementedError
 
     @abstractmethod
-    def transaction(self):  # pragma: no cover
+    def transaction(self, immediate: bool = False):  # pragma: no cover
         raise NotImplementedError
 
     @abstractmethod
     def migrate(self) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    @abstractmethod
+    def ping(self) -> bool:  # pragma: no cover
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def display_name(self) -> str:  # pragma: no cover
+        raise NotImplementedError
+
 
 class SqliteDatabase(DatabaseBackend):
     backend = "sqlite"
 
-    def __init__(self, path: Path = settings.database_path):
-        self.path = path
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path or settings.database_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
@@ -357,10 +755,26 @@ class SqliteDatabase(DatabaseBackend):
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @property
+    def display_name(self) -> str:
+        return str(self.path)
+
+    def ping(self) -> bool:
+        try:
+            with self.connect() as connection:
+                connection.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
     @contextmanager
-    def transaction(self) -> Generator[sqlite3.Connection, None, None]:
+    def transaction(
+        self, immediate: bool = False
+    ) -> Generator[sqlite3.Connection, None, None]:
         connection = self.connect()
         try:
+            if immediate:
+                connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except Exception:
@@ -371,7 +785,28 @@ class SqliteDatabase(DatabaseBackend):
 
     def migrate(self) -> None:
         with self.transaction() as connection:
-            connection.executescript(SCHEMA)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            applied = {
+                int(row["version"])
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
+            for version, script in MIGRATIONS:
+                if version in applied:
+                    continue
+                connection.executescript(script)
+                connection.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, _utc_now()),
+                )
             self._add_missing_columns(connection)
 
     @staticmethod
@@ -381,6 +816,36 @@ class SqliteDatabase(DatabaseBackend):
             "paper_positions": {
                 "frozen_quantity": "INTEGER NOT NULL DEFAULT 0",
                 "frozen_date": "TEXT",
+                "reserved_quantity": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "paper_accounts": {
+                "reserved_cash": "REAL NOT NULL DEFAULT 0",
+            },
+            "paper_orders": {
+                "filled_quantity": "INTEGER NOT NULL DEFAULT 0",
+                "average_fill_price": "REAL",
+                "reserved_cash": "REAL NOT NULL DEFAULT 0",
+                "reserved_quantity": "INTEGER NOT NULL DEFAULT 0",
+                "broker_order_id": "TEXT",
+                "last_error": "TEXT",
+                "strategy_run_id": "TEXT",
+                "order_intent_id": "TEXT",
+                "version": "INTEGER NOT NULL DEFAULT 0",
+                "submitted_at": "TEXT",
+                "completed_at": "TEXT",
+            },
+            "order_intents": {
+                "live_order_id": "TEXT",
+                "broker_order_id": "TEXT",
+                "execution_mode": "TEXT NOT NULL DEFAULT 'paper'",
+                "approval_status": "TEXT NOT NULL DEFAULT 'NOT_REQUIRED'",
+                "request_hash": "TEXT",
+            },
+            "backtest_runs": {
+                "manifest_id": "TEXT",
+            },
+            "strategy_runs": {
+                "manifest_id": "TEXT",
             },
         }
         for table, columns in expected.items():
@@ -397,24 +862,100 @@ class SqliteDatabase(DatabaseBackend):
                     )
 
 
+class PostgresDatabase(DatabaseBackend):
+    backend = "postgresql"
+
+    def __init__(self, url: Optional[str] = None):
+        url = url or settings.database_url
+        if not url:
+            raise ValueError(
+                "PostgreSQL 后端需要配置 QUANTDEV_DATABASE_URL"
+            )
+        self.url = url
+
+    @property
+    def display_name(self) -> str:
+        return "postgresql"
+
+    @staticmethod
+    def _driver():
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:  # pragma: no cover - packaging guard
+            raise RuntimeError(
+                "缺少 PostgreSQL 驱动，请安装项目依赖 psycopg[binary]"
+            ) from exc
+        return psycopg, dict_row
+
+    def connect(self) -> PostgresConnection:
+        psycopg, dict_row = self._driver()
+        connection = psycopg.connect(
+            self.url,
+            row_factory=dict_row,
+            connect_timeout=10,
+        )
+        return PostgresConnection(connection)
+
+    @contextmanager
+    def transaction(self, immediate: bool = False):
+        connection = self.connect()
+        try:
+            if immediate:
+                connection.execute("SELECT pg_advisory_xact_lock(817412)")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def ping(self) -> bool:
+        try:
+            with self.connect() as connection:
+                connection.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
+    def migrate(self) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            applied = {
+                int(row["version"])
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
+            for version, script in MIGRATIONS:
+                if version in applied:
+                    continue
+                connection.executescript(script)
+                connection.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, _utc_now()),
+                )
+
+
 # 向后兼容别名：历史代码以 Database 引用 SQLite 实现。
 Database = SqliteDatabase
 
 
 def create_database() -> DatabaseBackend:
-    """按配置选择数据库后端。
-
-    默认 sqlite；postgres 作为预留扩展点，未实现具体驱动前显式报错，
-    避免误以为已落地 PG 而把真实资金账本写到不存在的库上。
-    """
+    """按配置选择数据库后端。"""
     backend = settings.database_backend
     if backend in ("sqlite", ""):
         return SqliteDatabase()
     if backend in ("postgres", "postgresql"):
-        raise NotImplementedError(
-            "PostgreSQL 后端尚未实现：请保持 QUANTDEV_DATABASE_BACKEND=sqlite，"
-            "或先实现 PostgresDatabase 后端再切换。"
-        )
+        return PostgresDatabase()
     raise ValueError("未知的数据库后端：{}".format(backend))
 
 

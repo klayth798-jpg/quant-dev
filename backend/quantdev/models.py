@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -50,6 +50,8 @@ class PaperOrderRequest(BaseModel):
     quantity: int = Field(gt=0)
     order_type: str = "market"
     limit_price: Optional[float] = Field(default=None, gt=0)
+    strategy_run_id: Optional[str] = Field(default=None, max_length=80)
+    order_intent_id: Optional[str] = Field(default=None, max_length=80)
 
 
 class TushareSyncRequest(BaseModel):
@@ -71,3 +73,42 @@ class ApiMessage(BaseModel):
 class KillSwitchRequest(BaseModel):
     active: bool
     reason: str = Field(default="", max_length=200)
+
+
+class QuoteUpdateRequest(BaseModel):
+    symbol: str = Field(min_length=6, max_length=20)
+    price: float = Field(gt=0)
+    bid: Optional[float] = Field(default=None, gt=0)
+    ask: Optional[float] = Field(default=None, gt=0)
+    quote_time: datetime
+    source: str = Field(default="paper-feed", min_length=2, max_length=40)
+    status: str = Field(default="tradable", min_length=2, max_length=20)
+
+
+class StrategyConfigRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    factor_id: str = Field(default="momentum_20", min_length=2, max_length=80)
+    top_n: int = Field(default=5, ge=1, le=20)
+    rebalance_days: int = Field(default=5, ge=1, le=60)
+    universe_indices: Optional[List[str]] = None
+    neutralize: bool = False
+    order_type: str = "market"
+    max_order_notional: float = Field(default=5000, gt=0)
+    enabled: bool = False
+
+
+class StrategyRunRequest(BaseModel):
+    strategy_id: str = Field(min_length=4, max_length=80)
+    force: bool = False
+
+
+class StrategyEnableRequest(BaseModel):
+    enabled: bool
+
+
+class IntentApprovalRequest(BaseModel):
+    reason: str = Field(default="", max_length=200)
+
+
+class IntentRejectRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=200)

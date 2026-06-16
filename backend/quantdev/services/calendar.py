@@ -3,8 +3,8 @@
 A股不是 7×24 市场——非交易日、非交易时段下单只会被券商拒绝或排队到下一时段，
 是实盘里常见的"幽灵订单"来源。本模块提供两类判定：
 
-  1. 交易日：优先查 trade_calendar 表（来自 tushare 同步）；表中无该日记录时，
-     退化为"工作日(周一~周五)"兜底，保证 demo 模式下也可用。
+  1. 交易日：优先查 trade_calendar 表（来自 tushare 同步）；生产模式缺少日历时
+     失败关闭，只有 demo 模式允许退化为工作日兜底。
   2. 交易时段：A股连续竞价时段——上午 09:30–11:30、下午 13:00–15:00（北京时间 UTC+8）。
 
 判定一律基于北京时间（Asia/Shanghai，固定 UTC+8），不依赖服务器本地时区。
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 
+from quantdev.config import settings
 from quantdev.store import store
 
 CN_TZ = timezone(timedelta(hours=8))
@@ -30,7 +31,7 @@ class MarketClock:
     is_trading_day: bool
     is_trading_session: bool
     session: str  # morning / lunch_break / afternoon / closed
-    calendar_source: str  # calendar / weekday_fallback
+    calendar_source: str  # calendar / missing
     can_trade: bool
 
 
@@ -49,14 +50,15 @@ class TradingCalendarService:
         entry = store.calendar_entry(day.isoformat(), self.exchange)
         if entry is not None:
             return int(entry["is_open"]) == 1
-        # 日历无记录时退化为工作日兜底。
+        if settings.data_mode != "demo" and settings.calendar_fail_closed:
+            return False
         return day.weekday() < 5
 
     def _calendar_source(self, day: date) -> str:
         return (
             "calendar"
             if store.calendar_entry(day.isoformat(), self.exchange) is not None
-            else "weekday_fallback"
+            else "missing"
         )
 
     def _session(self, moment: time) -> str:
@@ -85,6 +87,41 @@ class TradingCalendarService:
             calendar_source=self._calendar_source(day),
             can_trade=trading_day and is_session,
         )
+
+    def latest_completed_trading_day(
+        self, moment: Optional[datetime] = None
+    ) -> Optional[date]:
+        moment = moment or self._now_cn()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=CN_TZ)
+        moment = moment.astimezone(CN_TZ)
+        today = moment.date()
+        today_entry = store.calendar_entry(today.isoformat(), self.exchange)
+        if today_entry is None and settings.data_mode != "demo":
+            return None
+        after_close = moment.time() >= AFTERNOON_CLOSE
+        if self.is_trading_day(today) and after_close:
+            return today
+        previous = store.previous_open_day(today.isoformat(), self.exchange)
+        if previous:
+            return date.fromisoformat(previous)
+        if settings.data_mode == "demo" or not settings.calendar_fail_closed:
+            cursor = today - timedelta(days=1)
+            while cursor.weekday() >= 5:
+                cursor -= timedelta(days=1)
+            return cursor
+        return None
+
+    def next_trading_day(self, day: date) -> Optional[date]:
+        next_day = store.next_open_day(day.isoformat(), self.exchange)
+        if next_day:
+            return date.fromisoformat(next_day)
+        if settings.data_mode == "demo" or not settings.calendar_fail_closed:
+            cursor = day + timedelta(days=1)
+            while cursor.weekday() >= 5:
+                cursor += timedelta(days=1)
+            return cursor
+        return None
 
 
 trading_calendar_service = TradingCalendarService()

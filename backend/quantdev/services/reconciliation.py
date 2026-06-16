@@ -4,7 +4,7 @@
 任何一笔订单状态误判、漏成交、重复扣费都会在这里暴露为"对账差异(break)"。
 
 对账口径：
-  - 现金：|本地现金 - Broker 现金| 超过 cash_tolerance 视为差异。
+  - 现金：两侧金额量化到“分”后逐分比较，差异超过 cash_tolerance_cents 视为差异。
   - 持仓：以 symbol 为键，逐一比对数量；本地有 Broker 无、Broker 有本地无、
     或数量不一致，都记为一条持仓差异。
 
@@ -15,25 +15,30 @@
 
 from typing import Any, Dict, List, Optional
 
+from quantdev.config import settings
 from quantdev.integrations.broker import BrokerAdapter, get_broker
+from quantdev.money import cents_to_yuan, round_money, to_cents
 from quantdev.services.events import EventType, event_bus
 from quantdev.services.execution import paper_execution_service
+from quantdev.services.live_guard import live_guard
 from quantdev.store import store
 
 
 class ReconciliationService:
-    cash_tolerance = 0.01
+    # 现金对账容差（单位：分）。两侧金额都已量化到分，默认 0 表示任何“分”级
+    # 差异都视为真实差异——彻底消除浮点边界把 1 分真实漂移当作平衡的旧问题。
+    cash_tolerance_cents = 0
 
     def run(self, broker: Optional[BrokerAdapter] = None) -> Dict[str, Any]:
         """执行一次对账并落库，返回对账报告。"""
         broker = broker or get_broker()
-        local = self._local_snapshot()
+        local = self._local_snapshot(broker)
         remote = self._broker_snapshot(broker)
         breaks = self._diff(local, remote)
         report = {
             "broker_mode": broker.mode,
             "status": "BALANCED" if not breaks else "BREAK",
-            "cash_diff": round(remote["cash"] - local["cash"], 2),
+            "cash_diff": cents_to_yuan(to_cents(remote["cash"]) - to_cents(local["cash"])),
             "breaks": breaks,
             "local": local,
             "broker": remote,
@@ -65,39 +70,90 @@ class ReconciliationService:
             },
             actor="local-user",
         )
+        if (
+            breaks
+            and settings.auto_kill_on_reconciliation_break
+            and broker.mode in {"live", "mock_live"}
+            and not live_guard.kill_switch_active()
+        ):
+            live_guard.activate_kill_switch(
+                "对账差异 {} 项，recon_id={}".format(len(breaks), recon_id),
+                actor="reconciliation-guard",
+            )
         return report
 
-    def _local_snapshot(self) -> Dict[str, Any]:
+    def _local_snapshot(self, broker: BrokerAdapter) -> Dict[str, Any]:
+        if broker.mode in {"live", "mock_live"}:
+            snapshot = store.local_live_snapshot()
+            if snapshot is None:
+                return {
+                    "cash": 0.0,
+                    "positions": {},
+                    "orders": {},
+                    "state_missing": True,
+                }
+            snapshot["orders"] = {
+                item["client_order_id"]: {
+                    "status": item["status"],
+                    "filled_quantity": int(item["filled_quantity"]),
+                }
+                for item in store.list_live_orders()
+            }
+            snapshot["state_missing"] = False
+            return snapshot
         account = paper_execution_service.get_account()
         return {
-            "cash": round(float(account["cash"]), 2),
+            "cash": round_money(account["cash"]),
             "positions": {
                 item["symbol"]: int(item["quantity"]) for item in account["positions"]
             },
+            "orders": {},
+            "state_missing": False,
         }
 
     def _broker_snapshot(self, broker: BrokerAdapter) -> Dict[str, Any]:
         account = broker.get_account()
         return {
-            "cash": round(float(account.cash), 2),
+            "cash": round_money(account.cash),
             "positions": {
                 item.symbol: int(item.quantity) for item in broker.get_positions()
             },
+            "orders": (
+                {
+                    item.client_order_id: {
+                        "status": item.status,
+                        "filled_quantity": int(item.filled_quantity),
+                    }
+                    for item in broker.get_orders()
+                }
+                if broker.mode in {"live", "mock_live"}
+                else {}
+            ),
         }
 
     def _diff(
         self, local: Dict[str, Any], remote: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         breaks: List[Dict[str, Any]] = []
-        cash_diff = remote["cash"] - local["cash"]
-        if abs(cash_diff) > self.cash_tolerance:
+        if local.get("state_missing"):
+            breaks.append(
+                {
+                    "type": "local_state",
+                    "symbol": None,
+                    "local": None,
+                    "broker": "available",
+                    "diff": "missing",
+                }
+            )
+        cash_diff_cents = to_cents(remote["cash"]) - to_cents(local["cash"])
+        if abs(cash_diff_cents) > self.cash_tolerance_cents:
             breaks.append(
                 {
                     "type": "cash",
                     "symbol": None,
                     "local": local["cash"],
                     "broker": remote["cash"],
-                    "diff": round(cash_diff, 2),
+                    "diff": cents_to_yuan(cash_diff_cents),
                 }
             )
         symbols = sorted(set(local["positions"]) | set(remote["positions"]))
@@ -112,6 +168,21 @@ class ReconciliationService:
                         "local": local_qty,
                         "broker": broker_qty,
                         "diff": broker_qty - local_qty,
+                    }
+                )
+        client_ids = sorted(set(local.get("orders", {})) | set(remote.get("orders", {})))
+        for client_order_id in client_ids:
+            local_order = local.get("orders", {}).get(client_order_id)
+            broker_order = remote.get("orders", {}).get(client_order_id)
+            if local_order != broker_order:
+                breaks.append(
+                    {
+                        "type": "order",
+                        "symbol": None,
+                        "client_order_id": client_order_id,
+                        "local": local_order,
+                        "broker": broker_order,
+                        "diff": "status_or_fill",
                     }
                 )
         return breaks

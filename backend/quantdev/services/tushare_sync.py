@@ -74,9 +74,10 @@ class TushareSyncService:
         unique_symbols = sorted(set(symbols))
         connection.executemany(
             """
-            INSERT OR IGNORE INTO instruments
+            INSERT INTO instruments
                 (symbol, name, exchange, asset_type, industry, active)
             VALUES (?, ?, ?, 'stock', '未分类', 1)
+            ON CONFLICT(symbol) DO NOTHING
             """,
             [
                 (
@@ -150,6 +151,11 @@ class TushareSyncService:
                 stats["financial_rows"] = self._sync_financials(
                     client, request, run_id
                 )
+            stats["manifest"] = store.save_dataset_manifest(
+                self.snapshot_id,
+                self.provider,
+                sync_run_id=run_id,
+            )
             self._set_run_state(run_id, "completed", stats, None, finished=True)
             store.audit(
                 actor="local-user",
@@ -550,9 +556,10 @@ class TushareSyncService:
             for index_code in index_codes:
                 connection.execute(
                     """
-                    INSERT OR IGNORE INTO indices
+                    INSERT INTO indices
                         (index_code, name, source, updated_at)
                     VALUES (?, ?, ?, ?)
+                    ON CONFLICT(index_code) DO NOTHING
                     """,
                     (index_code, index_code, self.provider, now),
                 )
@@ -595,9 +602,10 @@ class TushareSyncService:
                 symbol = str(row["con_code"])
                 connection.execute(
                     """
-                    INSERT OR IGNORE INTO instruments
+                    INSERT INTO instruments
                         (symbol, name, exchange, asset_type, industry, active)
                     VALUES (?, ?, ?, 'stock', '未分类', 1)
+                    ON CONFLICT(symbol) DO NOTHING
                     """,
                     (
                         symbol,

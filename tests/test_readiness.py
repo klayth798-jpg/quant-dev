@@ -35,7 +35,13 @@ def test_readiness_endpoint_structure():
 
 def test_fresh_env_not_ready_at_real_data_stage():
     # 全新测试库未跑过回测，第一阶段不就绪，current_stage 落在此。
+    # 注意：TestClient 启动时 lifespan 的 _ensure_demo_results() 会写入回测，
+    # 因此进入断言前先清空 backtest_runs，复现"从未回测"的全新环境。
+    from quantdev.db import database
+
     with TestClient(app) as client:
+        with database.transaction(immediate=True) as connection:
+            connection.execute("DELETE FROM backtest_runs")
         body = client.get("/api/live/readiness").json()
     assert body["all_ready"] is False
     assert body["current_stage"] == "real_data_backtest"
@@ -47,11 +53,15 @@ def test_fresh_env_not_ready_at_real_data_stage():
     )
 
 
-def test_mock_broker_stress_suite_detected():
-    # 压测套件文件已存在，该阶段的"套件存在"检查应通过。
+def test_mock_broker_stress_verification_detected():
+    # 只有真实执行并落库的通过记录，才能解锁该阶段。
     with TestClient(app):
         from quantdev.services.readiness import live_readiness_service
+        from quantdev.store import store
 
+        store.save_verification(
+            "mock_broker_stress", "PASSED", {"tests": 22}
+        )
         result = live_readiness_service.evaluate()
     stress = next(
         s for s in result["stages"] if s["key"] == "mock_broker_stress"

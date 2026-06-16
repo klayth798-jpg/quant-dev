@@ -1,6 +1,7 @@
 # Quant Dev
 
 一个可运行的量化研究、因子评估、策略回测、风险控制和模拟交易工作台。
+本地支持 SQLite 单进程开发，服务器支持 PostgreSQL、Redis Worker 和生产 Compose。
 
 当前版本提供完整的本地纵向链路：
 
@@ -10,8 +11,15 @@
 - 包含佣金、印花税、滑点和 100 股整数手的回测
 - 组合预交易风控
 - 幂等模拟委托、成交、现金和持仓账本
+- 实时行情时效闸门、T+1、冻结、撤单和订单恢复
+- 持久化策略运行、目标仓位和订单意图
+- 统一 Paper/Live 执行路由、持久化人工审批和实盘订单状态机
+- Kill Switch、每日亏损限制、Mock Broker 压测、同步和四方对账
+- 数据集 Manifest、回测数据版本绑定和盘中行情历史留痕
 - 只读研究 Agent 权限边界
 - FastAPI 和零构建 Web 工作台
+- PostgreSQL 生产账本、版本化迁移和 SQLite 批量迁移
+- Redis 持久任务队列、独立 Worker、失败重试和超时恢复
 
 实盘交易默认从代码层禁用。
 
@@ -27,6 +35,12 @@ make dev
 打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。
 
 API 文档位于 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)。
+
+使用 PostgreSQL + Redis 的本机容器栈：
+
+```bash
+docker compose up -d --build
+```
 
 ## 真实 A 股数据
 
@@ -101,14 +115,19 @@ make reset-real
 backend/quantdev/
   api.py                 HTTP API 与前端入口
   analytics.py           统计指标
-  db.py                  SQLite 研究与账本数据库
+  db.py                  SQLite/PostgreSQL 后端与版本化迁移
+  data_migration.py      SQLite 到 PostgreSQL 的 COPY 批量迁移
   services/
     market.py            数据快照
     factors.py           因子计算与评估
     backtest.py          成本后事件回测
     risk.py              预交易风控
     execution.py         模拟 OMS 与账本
+    pretrade.py          实盘报单前硬风控
+    execution_router.py  Paper/Live 执行路由
+    live_execution.py    实盘审批、报单、撤单和同步
     agent.py             只读研究 Agent
+    tasks.py             Redis 队列、任务恢复与 Worker
   integrations/
     market_data.py       行情数据适配器
     broker.py            Broker 边界
@@ -132,10 +151,14 @@ infra/                   容器部署
 - [前端操作手册](docs/FRONTEND_OPERATION_GUIDE.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [API 与权限清单](docs/API_AND_PERMISSIONS.md)
+- [模拟实盘与真实实盘操作手册](docs/LIVE_TRADING_RUNBOOK.md)
+- [服务器生产部署手册](docs/SERVER_DEPLOYMENT.md)
 
 ## 安全约束
 
 - 不允许把 `.env`、API Key、券商密钥提交到 Git。
 - Agent 仅依赖因子、回测和风险读取接口。
-- Broker 适配器默认使用 `DisabledLiveBroker`。
-- 实盘开放前必须增加身份认证、双人审批、Kill Switch 和每日对账。
+- `live` 模式未配置真实适配器时使用失败关闭边界，绝不会回退到 Mock Broker。
+- 管理写接口支持 `X-Admin-Key`；真实资金前仍应升级为正式登录、RBAC 和双人审批。
+- 实盘审批会保存操作人、理由、请求哈希和过期时间；订单参数变化后原审批自动失效。
+- `MockLiveBroker` 仅用于异常压测，不代表已经接入真实券商。

@@ -201,6 +201,68 @@ class FactorService:
             panel = self._neutralize_panel(panel)
         return panel
 
+    def latest_cross_section(
+        self,
+        factor_id: str,
+        snapshot_id: str,
+        as_of_date: str,
+        symbols: Optional[List[str]] = None,
+        neutralize: bool = False,
+    ) -> Dict[str, Any]:
+        rows = store.recent_price_rows(
+            snapshot_id=snapshot_id,
+            as_of_date=as_of_date,
+            limit_per_symbol=self.minimum_observations,
+            symbols=symbols,
+        )
+        series = self.group_price_rows(rows)
+        if factor_id in COMPOSITE_FACTORS:
+            component_scores: List[Tuple[Dict[str, float], float]] = []
+            for component_id, weight in COMPOSITE_FACTORS[factor_id]:
+                values = self._latest_values(component_id, series, as_of_date)
+                component_scores.append((self._winsorize_zscore(values), weight))
+            common = set(component_scores[0][0]) if component_scores else set()
+            for values, _weight in component_scores[1:]:
+                common.intersection_update(values)
+            scores = {
+                symbol: sum(values[symbol] * weight for values, weight in component_scores)
+                for symbol in common
+            }
+        else:
+            if not store.get_factor(factor_id):
+                raise ValueError("因子不存在: {}".format(factor_id))
+            scores = self._latest_values(factor_id, series, as_of_date)
+            scores = self._winsorize_zscore(scores)
+        if neutralize and scores:
+            industries = store.industry_map()
+            caps = store.latest_market_caps(as_of_date, list(scores))
+            log_caps = {
+                symbol: math.log(value) for symbol, value in caps.items() if value > 0
+            }
+            scores = self._neutralize_cross_section(scores, industries, log_caps)
+            scores = self._winsorize_zscore(scores)
+        return {
+            "factor_id": factor_id,
+            "snapshot_id": snapshot_id,
+            "signal_date": as_of_date,
+            "scores": scores,
+        }
+
+    def _latest_values(
+        self,
+        factor_id: str,
+        series: Dict[str, List[Dict[str, Any]]],
+        as_of_date: str,
+    ) -> Dict[str, float]:
+        values: Dict[str, float] = {}
+        for symbol, rows in series.items():
+            if not rows or rows[-1]["trade_date"] != as_of_date:
+                continue
+            value = self._factor_value(factor_id, rows, len(rows) - 1)
+            if value is not None and math.isfinite(value):
+                values[symbol] = value
+        return values
+
     def _build_composite_panel(
         self,
         factor_id: str,
@@ -261,19 +323,46 @@ class FactorService:
             neutralize=neutralize,
             series=series,
         )
+        # 前向收益按“交易日偏移”而非“行偏移”计算：用全市场统一的交易日历定位
+        # T+forward_days 的目标交易日，再取该标的当日复权价。若标的在目标日停牌/缺数据
+        # 则跳过，避免不同标的的前向窗口跨越不等长的日历区间，导致 IC 不可比。
+        all_dates = sorted(
+            {row["trade_date"] for rows in series.values() for row in rows}
+        )
+        date_position = {date: index for index, date in enumerate(all_dates)}
+        closes_by_symbol = {
+            symbol: {
+                row["trade_date"]: self._adjusted_close(row) for row in rows
+            }
+            for symbol, rows in series.items()
+        }
         forward_returns: Dict[Tuple[str, str], float] = {}
-        for symbol, rows in series.items():
-            for index, row in enumerate(rows[:-forward_days]):
-                forward_returns[(row["trade_date"], symbol)] = (
-                    self._adjusted_close(rows[index + forward_days])
-                    / self._adjusted_close(row)
-                    - 1
-                )
+        for symbol, by_date in closes_by_symbol.items():
+            for trade_date, base in by_date.items():
+                target_index = date_position[trade_date] + forward_days
+                if target_index >= len(all_dates) or base <= 0:
+                    continue
+                target_close = by_date.get(all_dates[target_index])
+                if target_close is None or target_close <= 0:
+                    continue
+                forward_returns[(trade_date, symbol)] = target_close / base - 1
 
+        # 非重叠采样：每个 IC / 多空收益观测都跨越独立的 forward_days 窗口，相邻采样日
+        # 至少间隔 forward_days 个交易日。否则按日重叠采样会让相邻观测高度自相关，
+        # 低估 IC 波动、虚高 IC-IR，并把重叠区间当独立区间年化。
         daily_ic: List[float] = []
         long_short_returns: List[float] = []
         observations = 0
+        last_sampled_position: Optional[int] = None
         for trade_date in sorted(panel):
+            position = date_position.get(trade_date)
+            if position is None:
+                continue
+            if (
+                last_sampled_position is not None
+                and position - last_sampled_position < forward_days
+            ):
+                continue
             pairs = [
                 (value, forward_returns[(trade_date, symbol)])
                 for symbol, value in panel[trade_date].items()
@@ -281,6 +370,7 @@ class FactorService:
             ]
             if len(pairs) < 4:
                 continue
+            last_sampled_position = position
             factors = [pair[0] for pair in pairs]
             returns = [pair[1] for pair in pairs]
             daily_ic.append(spearman(factors, returns))

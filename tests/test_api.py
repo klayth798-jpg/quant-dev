@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import pytest
 import quantdev.api as api_module
 from fastapi.testclient import TestClient
 from quantdev.api import app
@@ -15,6 +16,20 @@ def test_dashboard_and_factor_endpoints():
     assert dashboard.json()["instrument_count"] == 8
     assert factors.status_code == 200
     assert len(factors.json()["items"]) == 5
+
+
+def test_health_endpoints():
+    with TestClient(app) as client:
+        live = client.get("/api/health/live")
+        ready = client.get("/api/health/ready")
+
+    assert live.json() == {"status": "ok"}
+    assert ready.status_code == 200
+    assert ready.json() == {
+        "status": "ready",
+        "database": True,
+        "queue": True,
+    }
 
 
 def test_risk_endpoint():
@@ -93,13 +108,10 @@ def test_default_broker_is_disabled():
     assert isinstance(broker, DisabledLiveBroker)
     assert broker.health_check().healthy is True
     assert broker.get_positions() == []
-    try:
+    with pytest.raises(PermissionError):
         broker.submit_order(
             BrokerOrder("disabled1", "600519.SH", "buy", 100, "limit", 10.0)
         )
-        assert False, "disabled broker 不应允许下单"
-    except PermissionError:
-        pass
 
 
 def test_mock_live_broker_scenarios(monkeypatch):
@@ -133,27 +145,51 @@ def test_mock_live_broker_scenarios(monkeypatch):
         ),
     )
 
-    order = BrokerOrder(
-        "mocktest1", "600519.SH", "buy", 200, "limit", 10.0, approved=True
-    )
-
     partial = MockLiveBroker(scenario="partial")
-    ack = partial.submit_order(order)
+    ack = partial.submit_order(
+        BrokerOrder(
+            "mocktest-partial",
+            "600519.SH",
+            "buy",
+            200,
+            "limit",
+            10.0,
+            approved=True,
+        )
+    )
     assert ack.status == "PARTIALLY_FILLED"
-    assert 0 < ack.filled_quantity < order.quantity
+    assert 0 < ack.filled_quantity < 200
 
     reject = MockLiveBroker(scenario="reject")
-    assert reject.submit_order(order).accepted is False
+    reject_ack = reject.submit_order(
+        BrokerOrder(
+            "mocktest-reject",
+            "600519.SH",
+            "buy",
+            200,
+            "limit",
+            10.0,
+            approved=True,
+        )
+    )
+    assert reject_ack.accepted is False
 
     cancel_fail = MockLiveBroker(scenario="cancel_fail")
     assert cancel_fail.cancel_order("mock-000001").accepted is False
 
     timeout = MockLiveBroker(scenario="timeout")
-    try:
-        timeout.submit_order(order)
-        assert False, "timeout 场景应抛 TimeoutError"
-    except TimeoutError:
-        pass
+    with pytest.raises(TimeoutError):
+        timeout.submit_order(
+            BrokerOrder(
+                "mocktest-timeout",
+                "600519.SH",
+                "buy",
+                200,
+                "limit",
+                10.0,
+                approved=True,
+            )
+        )
     assert timeout.health_check().healthy is False
 
 
@@ -164,11 +200,8 @@ def test_mock_live_broker_blocked_without_live_config():
     order = BrokerOrder(
         "guarded1", "600519.SH", "buy", 100, "limit", 10.0, approved=True
     )
-    try:
+    with pytest.raises(PermissionError):
         MockLiveBroker(scenario="normal").submit_order(order)
-        assert False, "守卫应拦截未开启实盘的下单"
-    except PermissionError:
-        pass
 
 
 def test_reconciliation_balanced_with_paper_broker():
@@ -302,11 +335,8 @@ def test_live_order_blocked_outside_trading_session(monkeypatch):
     order = BrokerOrder(
         "clock-blocked", "600519.SH", "buy", 100, "limit", 10.0, approved=True
     )
-    try:
+    with pytest.raises(PermissionError, match="非交易时段"):
         MockLiveBroker(scenario="normal").submit_order(order)
-        assert False, "非交易时段应被守卫拦截"
-    except PermissionError as exc:
-        assert "非交易时段" in str(exc)
 
 
 def test_market_clock_endpoint():
@@ -479,3 +509,70 @@ def test_halted_symbol_rejected(monkeypatch):
     body = order.json()
     assert body["status"] == "REJECTED"
     assert "停牌" in body["reject_reason"]
+
+
+def test_admin_write_blocked_when_no_key_and_insecure_disabled(monkeypatch):
+    """安全默认：无 admin key 且未显式放行时，所有写操作一律 503。"""
+    monkeypatch.setattr(
+        api_module,
+        "settings",
+        replace(api_module.settings, admin_api_key="", admin_allow_insecure=False),
+    )
+    with TestClient(app) as client:
+        # 写操作被关闭
+        assert client.post("/api/backtests", json={}).status_code == 503
+        assert (
+            client.post("/api/risk/check", json={"positions": []}).status_code == 503
+        )
+        assert (
+            client.post(
+                "/api/strategies/run", json={"strategy_id": "demo"}
+            ).status_code
+            == 503
+        )
+        # 只读操作不受影响
+        assert client.get("/api/dashboard").status_code == 200
+
+
+def test_admin_write_requires_matching_key(monkeypatch):
+    """配置了 admin key 时：缺失/错误 key 401，正确 key 放行。"""
+    monkeypatch.setattr(
+        api_module,
+        "settings",
+        replace(api_module.settings, admin_api_key="secret", admin_allow_insecure=False),
+    )
+    with TestClient(app) as client:
+        # 缺 key
+        assert client.post("/api/risk/check", json={"positions": []}).status_code == 401
+        # 错 key
+        assert (
+            client.post(
+                "/api/risk/check",
+                json={"positions": []},
+                headers={"X-Admin-Key": "wrong"},
+            ).status_code
+            == 401
+        )
+        # 正确 key
+        ok = client.post(
+            "/api/risk/check",
+            json={"positions": []},
+            headers={"X-Admin-Key": "secret"},
+        )
+        assert ok.status_code == 200
+
+
+def test_heavy_post_endpoints_now_guarded(monkeypatch):
+    """此前裸奔的重活 POST 现在需要鉴权。"""
+    monkeypatch.setattr(
+        api_module,
+        "settings",
+        replace(api_module.settings, admin_api_key="secret", admin_allow_insecure=False),
+    )
+    with TestClient(app) as client:
+        for path, payload in (
+            ("/api/backtests", {}),
+            ("/api/factors/momentum/evaluate", {"forward_days": 5}),
+            ("/api/agent/research", {"question": "测试问题"}),
+        ):
+            assert client.post(path, json=payload).status_code == 401
