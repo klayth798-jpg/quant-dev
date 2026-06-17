@@ -81,16 +81,20 @@ def main() -> None:
         result = tushare_sync_service.run(queued["run_id"], request)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "worker":
+        from quantdev.alerting import install_event_alerts
         from quantdev.services.tasks import task_service
 
+        install_event_alerts()
         if args.once:
             result = task_service.run_once(timeout=1)
             print(json.dumps(result or {"status": "idle"}, ensure_ascii=False, indent=2))
         else:
             task_service.loop()
     elif args.command == "paper-runner":
+        from quantdev.alerting import install_event_alerts
         from quantdev.services.strategy import strategy_runner_service
 
+        install_event_alerts()
         if args.once:
             print(
                 json.dumps(

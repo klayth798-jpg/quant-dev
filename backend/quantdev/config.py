@@ -15,6 +15,24 @@ def _resolve_path(raw_path: str) -> Path:
     return path.resolve()
 
 
+def _parse_operator_keys(raw: str) -> dict:
+    """解析 QUANTDEV_OPERATOR_KEYS="alice:keyA,bob:keyB" 为 {key: operator} 反查表。
+
+    把操作员身份绑定到各自的密钥（而非客户端可伪造的 X-Operator 头），使双人复核
+    （maker-checker）可信：不同 actor 必然对应不同密钥。配置后即取代单一共享 admin key。
+    """
+    mapping: dict = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        name, key = item.split(":", 1)
+        name, key = name.strip(), key.strip()
+        if name and key:
+            mapping[key] = name
+    return mapping
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str
@@ -54,6 +72,11 @@ class Settings:
     quote_max_spread_bps: float
     admin_api_key: str
     admin_allow_insecure: bool
+    alert_webhook_url: str
+    require_dual_approval: bool
+    reconciliation_interval_seconds: int
+    reconciliation_cash_tolerance_cents: int
+    operator_keys: dict
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -150,6 +173,20 @@ class Settings:
                 "QUANTDEV_ALLOW_INSECURE_ADMIN", "false"
             ).lower()
             == "true",
+            alert_webhook_url=os.getenv("QUANTDEV_ALERT_WEBHOOK_URL", "").strip(),
+            require_dual_approval=os.getenv(
+                "QUANTDEV_REQUIRE_DUAL_APPROVAL", "true"
+            ).lower()
+            == "true",
+            reconciliation_interval_seconds=int(
+                os.getenv("QUANTDEV_RECONCILIATION_INTERVAL_SECONDS", "300")
+            ),
+            reconciliation_cash_tolerance_cents=int(
+                os.getenv("QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS", "0")
+            ),
+            operator_keys=_parse_operator_keys(
+                os.getenv("QUANTDEV_OPERATOR_KEYS", "")
+            ),
         )
 
 

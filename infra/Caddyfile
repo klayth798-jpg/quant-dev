@@ -1,4 +1,27 @@
 {$QUANTDEV_DOMAIN:localhost} {
     encode zstd gzip
+
+    # 第一道闸（sec-2）：IP allowlist。账户/持仓/盈亏等敏感接口绝不应裸暴露公网。
+    # 默认仅放行本机与内网网段；设置 QUANTDEV_ALLOWED_IPS（空格分隔 CIDR，如
+    # "203.0.113.0/24 198.51.100.7/32"）收紧到办公网 / VPN 出口。公网 IP 默认 403。
+    @blocked not remote_ip {$QUANTDEV_ALLOWED_IPS:127.0.0.1/32 ::1 private_ranges}
+    respond @blocked "Forbidden" 403
+
+    # 更强的可选第二道闸：对全站启用基本认证（需要先生成 bcrypt hash）：
+    #   docker run --rm caddy caddy hash-password --plaintext 'your-strong-pass'
+    # 然后取消下面注释并配置 QUANTDEV_BASIC_AUTH_USER / QUANTDEV_BASIC_AUTH_HASH。
+    # 注意：basic_auth 会要求前端 SPA 也带凭证，适合纯运维场景或配合 VPN 使用。
+    # basic_auth {
+    #     {$QUANTDEV_BASIC_AUTH_USER:operator} {$QUANTDEV_BASIC_AUTH_HASH}
+    # }
+
+    header {
+        Strict-Transport-Security "max-age=31536000;"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
     reverse_proxy app:8000
 }

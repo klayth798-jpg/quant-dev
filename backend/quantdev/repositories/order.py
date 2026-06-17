@@ -2,6 +2,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from quantdev.db import database
+from quantdev.money import round_money, to_decimal
 from quantdev.repositories.base import decode_json, new_id, utc_now
 
 
@@ -262,12 +263,13 @@ class OrderRepository:
         last_error: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = utc_now()
-        terminal = status in {
+        terminal_statuses = {
             "FILLED",
             "CANCELLED",
             "PARTIALLY_CANCELLED",
             "REJECTED",
         }
+        terminal = status in terminal_statuses
         with database.transaction(immediate=True) as connection:
             current = connection.execute(
                 "SELECT * FROM live_orders WHERE order_id = ?",
@@ -275,6 +277,13 @@ class OrderRepository:
             ).fetchone()
             if not current:
                 raise ValueError("实盘订单不存在")
+            # 终态保护：订单已是终态后，拒绝被恢复/巡检的陈旧/回退快照降级为非终态，
+            # 否则已确定的 FILLED/CANCELLED 会被覆盖、filled_quantity 被改写，污染对账基线。
+            if (
+                current["status"] in terminal_statuses
+                and status not in terminal_statuses
+            ):
+                return self.get_live_order(order_id)
             broker_id = broker_order_id or current["broker_order_id"]
             filled = (
                 int(filled_quantity)
@@ -494,6 +503,62 @@ class OrderRepository:
                 row["symbol"]: int(row["quantity"]) for row in positions
             },
             "updated_at": account["updated_at"],
+        }
+
+    def derive_live_ledger(
+        self, baseline: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """从基线锚点 + 成交流水(live_trades)独立推导现金与持仓（对账的“独立账本”一侧）。
+
+        关键：不读 live_account_state（它只是券商状态的本地副本），而是用 OMS 自己记录的
+        逐笔成交独立推导，从而能与券商真值做三方比对、检出真实漂移（漏成交/重复扣费）。
+
+        baseline（推荐）：``{cash, positions, trade_ids}``——某个已知时点的券商现金/持仓
+        与“截至该时点已记录的成交集合”。推导时只回放 trade_ids 之外（基线之后）的成交，
+        避免把基线现金里已包含的成交再减一遍（否则会产生幽灵差异、误触发自动熔断）。
+        不传 baseline 时退化为“注资基准 initial_cash + 全部成交”（仅适用于从零起记的账户）。
+        """
+        with database.connect() as connection:
+            state = connection.execute(
+                "SELECT account_id, initial_cash FROM live_account_state "
+                "ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+            trades = connection.execute(
+                "SELECT symbol, side, quantity, price, fees, broker_trade_id "
+                "FROM live_trades ORDER BY traded_at"
+            ).fetchall()
+        if baseline is not None:
+            cash = to_decimal(baseline.get("cash", 0))
+            positions: Dict[str, int] = {
+                symbol: int(qty)
+                for symbol, qty in (baseline.get("positions") or {}).items()
+            }
+            skip = set(baseline.get("trade_ids") or [])
+        else:
+            cash = to_decimal(float(state["initial_cash"])) if state else to_decimal(0)
+            positions = {}
+            skip = set()
+        trade_ids: List[str] = []
+        for trade in trades:
+            trade_ids.append(trade["broker_trade_id"])
+            if trade["broker_trade_id"] in skip:
+                continue  # 基线之前的成交已包含在 baseline.cash/positions 中，不重复回放
+            quantity = int(trade["quantity"])
+            gross = to_decimal(round_money(quantity * float(trade["price"])))
+            fees = to_decimal(trade["fees"] or 0)
+            if str(trade["side"]).lower() == "buy":
+                cash = cash - gross - fees
+                positions[trade["symbol"]] = positions.get(trade["symbol"], 0) + quantity
+            else:
+                cash = cash + gross - fees
+                positions[trade["symbol"]] = positions.get(trade["symbol"], 0) - quantity
+        return {
+            "account_id": state["account_id"] if state else None,
+            "cash": round_money(cash),
+            "positions": {symbol: qty for symbol, qty in positions.items() if qty != 0},
+            "trade_ids": trade_ids,
+            "trade_count": len(trade_ids),
+            "has_baseline": (baseline is not None) or (state is not None),
         }
 
     def append_order_event(

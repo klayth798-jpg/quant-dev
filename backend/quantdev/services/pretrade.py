@@ -1,5 +1,6 @@
 from typing import Any, Dict
 
+from quantdev.alerting import alert_service
 from quantdev.config import settings
 from quantdev.integrations.broker import BrokerAdapter
 from quantdev.models import PositionInput, RiskCheckRequest
@@ -134,12 +135,26 @@ class PreTradeRiskService:
             account.account_id, today, account.equity
         )
         if daily["daily_pnl"] <= -settings.max_daily_loss:
-            reasons.append(
-                "当日亏损 {:.2f} 已达到限额 {:.2f}".format(
-                    daily["daily_pnl"], settings.max_daily_loss
-                )
+            # 日亏损触限：阻断新增风险（买入），但放行减仓/止损卖出离场，并 critical 告警，
+            # 由人工决定是否手动熔断。自动全局冻结会把止损单一起锁死，反而更危险（ptr-2 修正）。
+            alert_service.send(
+                "实盘当日亏损触及限额",
+                "daily_pnl={:.2f} 限额={:.2f} account={}（已阻断新增买入，卖出离场仍放行）".format(
+                    daily["daily_pnl"], settings.max_daily_loss, account.account_id
+                ),
+                severity="critical",
+                dedup_key="daily_loss_limit:{}".format(account.account_id),
             )
+            if side == "buy":
+                reasons.append(
+                    "当日亏损 {:.2f} 已达到限额 {:.2f}，已阻断新增买入".format(
+                        daily["daily_pnl"], settings.max_daily_loss
+                    )
+                )
 
+        # 组合层风控只对买入执行（ptr-1 修正）：long-only 体系下卖出是减仓/降风险，
+        # 对其施加集中度/换手/单笔占比限额会锁死止损离场，与风控目的相悖。账户层熔断
+        # 由 Kill Switch（人工或对账触发）承担，而不是逐单拦截卖出。
         if side == "buy" and account.equity > 0:
             projected = []
             for item in positions:

@@ -232,6 +232,100 @@ def test_daily_pnl_anchors_to_funded_equity_not_intraday():
     assert snap3["start_equity"] == 940_000
 
 
+def test_daily_loss_blocks_buys_and_alerts_but_does_not_trap_exits(live_ready, monkeypatch):
+    """日亏损触限：阻断新增买入 + critical 告警，但不自动全局冻结（保留止损离场，ptr-2 修正）。"""
+    import quantdev.services.pretrade as pretrade_module
+    from quantdev.integrations.broker import AccountSnapshot
+    from quantdev.services.live_guard import live_guard
+    from quantdev.services.pretrade import pretrade_risk_service
+
+    intent_id = _insert_live_intent()
+    broker = MockLiveBroker(scenario="normal")
+    # 券商账户体现 5 万浮亏（equity 远低于注资基准），超过 live_ready 的 1 万日亏损限额。
+    monkeypatch.setattr(
+        broker,
+        "get_account",
+        lambda: AccountSnapshot(
+            account_id="mock-live", cash=1_000_000.0, market_value=0.0, equity=950_000.0
+        ),
+    )
+    alerts = []
+    monkeypatch.setattr(
+        pretrade_module.alert_service,
+        "send",
+        lambda *a, **k: alerts.append((a, k)),
+    )
+    intent = store.get_order_intent(intent_id)  # 买单
+    with pytest.raises(PermissionError, match="当日亏损"):
+        pretrade_risk_service.check(intent, broker, approved=True)
+    # 告警已发，但不自动激活全局 Kill Switch（避免锁死止损单）。
+    assert alerts
+    assert live_guard.kill_switch_active() is False
+
+
+def test_update_live_order_terminal_guard(live_ready):
+    """终态保护：已 FILLED 的订单不能被陈旧/回退快照降级为非终态。"""
+    intent_id = _insert_live_intent()
+    broker = MockLiveBroker(scenario="normal")
+    live_execution_service.approve_intent(intent_id)
+    result = live_execution_service.submit_intent(intent_id, broker=broker)
+    order_id = result["order"]["order_id"]
+    assert store.get_live_order(order_id)["status"] == "FILLED"
+
+    # 试图把终态降级为非终态 → 被拒绝，保持 FILLED。
+    store.update_live_order(order_id, status="OPEN")
+    assert store.get_live_order(order_id)["status"] == "FILLED"
+
+
+def test_dual_approval_blocks_self_submit(live_ready):
+    """双人复核（maker-checker）：审批人不能同时提交，需另一操作员提交（sec-1）。"""
+    intent_id = _insert_live_intent()
+    broker = MockLiveBroker(scenario="normal")
+    live_execution_service.approve_intent(intent_id, actor="alice")
+
+    with pytest.raises(PermissionError, match="双人复核"):
+        live_execution_service.submit_intent(intent_id, broker=broker, actor="alice")
+
+    # 另一操作员提交则放行。
+    result = live_execution_service.submit_intent(intent_id, broker=broker, actor="bob")
+    assert result["order"]["status"] == "FILLED"
+
+
+def test_reconciliation_independent_ledger_detects_missed_fill(live_ready):
+    """独立影子账本对账：基线之后券商成交但本地漏记，应检出三类差异（recon-1/recon-5）。"""
+    from quantdev.integrations.broker import BrokerOrder
+    from quantdev.services.reconciliation import reconciliation_service
+
+    intent_id = _insert_live_intent()
+    broker = MockLiveBroker(scenario="normal")
+    live_execution_service.approve_intent(intent_id)
+    live_execution_service.submit_intent(intent_id, broker=broker)
+    live_execution_service.sync_broker(broker)  # 灌入 live_trades + 账户基线
+
+    # 首次对账建立基线锚点（含已记录成交），应平衡。
+    balanced = reconciliation_service.run(broker=broker)
+    assert balanced["status"] == "BALANCED", balanced["breaks"]
+
+    # 基线之后券商又成交一笔，但本地从未 sync_broker（漏记成交）。
+    broker.submit_order(
+        BrokerOrder(
+            client_order_id="missed-fill-0001",
+            symbol="600519.SH",
+            side="buy",
+            quantity=100,
+            order_type="limit",
+            limit_price=10,
+            approved=True,
+        )
+    )
+    broken = reconciliation_service.run(broker=broker)
+    assert broken["status"] == "BREAK"
+    types = {item["type"] for item in broken["breaks"]}
+    assert "trade" in types
+    assert "cash" in types
+    assert "position" in types
+
+
 def test_live_factory_never_falls_back_to_mock(monkeypatch):
     import quantdev.services.live_guard as guard_module
     from quantdev.integrations.broker import get_broker

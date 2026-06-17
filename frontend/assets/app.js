@@ -107,21 +107,25 @@ async function loadCoreData() {
     readiness,
     strategies,
     strategyRuns,
-  ] = await Promise.all([
-    api("/api/dashboard"),
-    api("/api/factors"),
-    api("/api/backtests"),
-    api("/api/instruments"),
-    api("/api/system/requirements"),
-    api("/api/paper/account"),
-    api("/api/data/status"),
-    api("/api/data/indices"),
-    api("/api/live/guard"),
-    api("/api/live/market-clock"),
-    api("/api/live/readiness"),
-    api("/api/strategies"),
-    api("/api/strategies/runs"),
-  ]);
+  ] = (
+    // 用 allSettled 优雅降级：未输入 admin key 时受保护接口(账户/guard)会 401/503，
+    // 不应拖垮整个首屏；失败项回退到安全默认，对应面板单独显示“需认证/暂不可用”。
+    await Promise.allSettled([
+      api("/api/dashboard"),
+      api("/api/factors"),
+      api("/api/backtests"),
+      api("/api/instruments"),
+      api("/api/system/requirements"),
+      api("/api/paper/account"),
+      api("/api/data/status"),
+      api("/api/data/indices"),
+      api("/api/live/guard"),
+      api("/api/live/market-clock"),
+      api("/api/live/readiness"),
+      api("/api/strategies"),
+      api("/api/strategies/runs"),
+    ])
+  ).map((r, i) => (r.status === "fulfilled" ? r.value : DASHBOARD_FALLBACKS[i]));
   state.dashboard = dashboard;
   state.factors = factors.items;
   state.backtests = backtests.items;
@@ -138,6 +142,23 @@ async function loadCoreData() {
   document.querySelector("#snapshot-label").textContent =
     dashboard.snapshot_id || "暂无数据快照";
 }
+
+// 首屏各接口失败时的安全回退（与 Promise.allSettled 顺序一一对应），避免单点 401 拖垮整页。
+const DASHBOARD_FALLBACKS = [
+  {}, // dashboard
+  { items: [] }, // factors
+  { items: [] }, // backtests
+  { items: [] }, // instruments
+  {}, // requirements
+  { positions: [], orders: [], cash: null, equity: null, requires_auth: true }, // paper/account
+  {}, // data/status
+  { items: [] }, // data/indices
+  { kill_switch: { active: false }, requires_auth: true }, // live/guard
+  {}, // market-clock
+  {}, // readiness
+  { items: [] }, // strategies
+  { items: [] }, // strategies/runs
+];
 
 function metric(label, value, note = "", tone = "") {
   return `

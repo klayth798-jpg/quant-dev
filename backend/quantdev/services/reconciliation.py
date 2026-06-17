@@ -13,6 +13,7 @@
   - BREAK：存在现金或持仓差异，需人工核查（实盘中通常应触发 Kill Switch）。
 """
 
+import json
 from typing import Any, Dict, List, Optional
 
 from quantdev.config import settings
@@ -25,9 +26,14 @@ from quantdev.store import store
 
 
 class ReconciliationService:
-    # 现金对账容差（单位：分）。两侧金额都已量化到分，默认 0 表示任何“分”级
-    # 差异都视为真实差异——彻底消除浮点边界把 1 分真实漂移当作平衡的旧问题。
-    cash_tolerance_cents = 0
+    baseline_flag = "live_ledger_baseline"
+
+    @property
+    def cash_tolerance_cents(self) -> int:
+        # 现金对账容差（分），由 QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS 配置。
+        # 默认 0（精确到分）；接真实券商时可放宽几分，吸收券商费用/逐笔舍入口径差异，
+        # 避免无害尾差误触发自动熔断。
+        return settings.reconciliation_cash_tolerance_cents
 
     def run(self, broker: Optional[BrokerAdapter] = None) -> Dict[str, Any]:
         """执行一次对账并落库，返回对账报告。"""
@@ -82,25 +88,61 @@ class ReconciliationService:
             )
         return report
 
+    def _ledger_baseline(self, broker: BrokerAdapter) -> Dict[str, Any]:
+        """获取/建立影子账本基线锚点（recon-1 基线双算修复）。
+
+        首次对账时以“当前券商现金/持仓 + 截至此刻已记录的成交集合”作为基线，之后只检测
+        基线之后新产生的漂移，避免把基线现金里已包含的历史成交再减一遍而误触发熔断。
+        """
+        existing = store.get_flag(self.baseline_flag)
+        if existing and existing.get("value"):
+            try:
+                return json.loads(existing["value"])
+            except (ValueError, TypeError):
+                pass
+        account = broker.get_account()
+        baseline = {
+            "cash": round_money(account.cash),
+            "positions": {
+                item.symbol: int(item.quantity) for item in broker.get_positions()
+            },
+            "trade_ids": store.derive_live_ledger()["trade_ids"],
+        }
+        store.set_flag(
+            self.baseline_flag,
+            json.dumps(baseline),
+            "建立影子账本基线",
+            "reconciliation",
+        )
+        return baseline
+
     def _local_snapshot(self, broker: BrokerAdapter) -> Dict[str, Any]:
         if broker.mode in {"live", "mock_live"}:
-            snapshot = store.local_live_snapshot()
-            if snapshot is None:
+            # 用独立推导的影子账本（基线锚点 + 之后的成交流水）作为“本地”一侧，而不是
+            # 券商状态的本地副本，这样才能与券商真值真正三方比对（recon-1）。
+            baseline = self._ledger_baseline(broker)
+            ledger = store.derive_live_ledger(baseline=baseline)
+            if not ledger["has_baseline"]:
                 return {
                     "cash": 0.0,
                     "positions": {},
                     "orders": {},
+                    "trade_ids": [],
                     "state_missing": True,
                 }
-            snapshot["orders"] = {
-                item["client_order_id"]: {
-                    "status": item["status"],
-                    "filled_quantity": int(item["filled_quantity"]),
-                }
-                for item in store.list_live_orders()
+            return {
+                "cash": ledger["cash"],
+                "positions": ledger["positions"],
+                "orders": {
+                    item["client_order_id"]: {
+                        "status": item["status"],
+                        "filled_quantity": int(item["filled_quantity"]),
+                    }
+                    for item in store.list_live_orders()
+                },
+                "trade_ids": ledger["trade_ids"],
+                "state_missing": False,
             }
-            snapshot["state_missing"] = False
-            return snapshot
         account = paper_execution_service.get_account()
         return {
             "cash": round_money(account["cash"]),
@@ -128,6 +170,11 @@ class ReconciliationService:
                 }
                 if broker.mode in {"live", "mock_live"}
                 else {}
+            ),
+            "trade_ids": (
+                [item.trade_id for item in broker.get_trades()]
+                if broker.mode in {"live", "mock_live"}
+                else []
             ),
         }
 
@@ -170,6 +217,22 @@ class ReconciliationService:
                         "diff": broker_qty - local_qty,
                     }
                 )
+        # 逐笔成交对账（recon-5）：券商有、本地成交流水无 = 漏成交（最危险，必报）。
+        # 仅检“漏成交”方向：券商 get_trades 可能是窗口化的，本地多出的旧成交不据此判幻象，
+        # 避免窗口化导致的假差异在 live 模式误触 Kill Switch。
+        broker_trades = set(remote.get("trade_ids", []))
+        local_trades = set(local.get("trade_ids", []))
+        for trade_id in sorted(broker_trades - local_trades):
+            breaks.append(
+                {
+                    "type": "trade",
+                    "symbol": None,
+                    "broker_trade_id": trade_id,
+                    "local": None,
+                    "broker": trade_id,
+                    "diff": "missing_in_local",
+                }
+            )
         client_ids = sorted(set(local.get("orders", {})) | set(remote.get("orders", {})))
         for client_order_id in client_ids:
             local_order = local.get("orders", {}).get(client_order_id)

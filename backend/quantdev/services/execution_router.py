@@ -107,7 +107,9 @@ class ExecutionRouter:
                     "status": updated["status"],
                     "order_id": None,
                 }
-            result = live_execution_service.submit_intent(intent_id)
+            result = live_execution_service.submit_intent(
+                intent_id, actor="execution-router"
+            )
             return {
                 "intent_id": intent_id,
                 "status": result["order"]["status"],

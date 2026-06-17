@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from quantdev.alerting import alert_service
 from quantdev.config import settings
 from quantdev.integrations.broker import BrokerAdapter, BrokerOrder, get_broker
 from quantdev.services.pretrade import pretrade_risk_service
@@ -15,7 +16,14 @@ ACTIVE_LIVE_STATUSES = {
     "PARTIALLY_FILLED",
     "UNKNOWN",
     "CANCEL_PENDING",
+    # 撤单失败不是终态而是“需查询确认”态：纳入 active，确保恢复轮询继续追踪（oms-2）。
+    "CANCEL_FAILED",
 }
+
+# 启动/巡检时需要向券商查询确认、把本地收敛到真值的中间态。
+RECOVERABLE_LIVE_STATUSES = sorted(
+    {"SUBMITTING", "SUBMITTED", "UNKNOWN", "CANCEL_PENDING", "CANCEL_FAILED"}
+)
 TERMINAL_LIVE_STATUSES = {
     "FILLED",
     "CANCELLED",
@@ -109,6 +117,7 @@ class LiveExecutionService:
         self,
         intent_id: str,
         broker: Optional[BrokerAdapter] = None,
+        actor: Optional[str] = None,
     ) -> Dict[str, Any]:
         intent = store.get_order_intent(intent_id)
         if not intent:
@@ -125,7 +134,7 @@ class LiveExecutionService:
         ):
             raise ValueError("该订单正在提交中，请勿并发重复提交")
         try:
-            return self._submit_intent_locked(intent_id, intent, broker)
+            return self._submit_intent_locked(intent_id, intent, broker, actor)
         finally:
             store.release_lease(lock_key, lock_owner)
 
@@ -134,6 +143,7 @@ class LiveExecutionService:
         intent_id: str,
         intent: Dict[str, Any],
         broker: Optional[BrokerAdapter],
+        actor: Optional[str] = None,
     ) -> Dict[str, Any]:
         existing = (
             store.get_live_order(intent["live_order_id"])
@@ -146,6 +156,17 @@ class LiveExecutionService:
             return {"idempotent": True, "order": existing}
 
         approval = self._valid_approval(intent)
+        # 双人复核（maker-checker，sec-1）：提交人不能与审批人是同一身份，
+        # 防止单人用一把 key 走完“自批自下”的完整下单闭环。
+        if (
+            settings.require_dual_approval
+            and approval is not None
+            and actor is not None
+            and approval.get("approved_by") == actor
+        ):
+            raise PermissionError(
+                "双人复核：审批人({})不能同时提交订单，需由另一操作员提交".format(actor)
+            )
         broker = broker or get_broker()
         try:
             pretrade_risk_service.check(intent, broker, approved=True)
@@ -177,26 +198,42 @@ class LiveExecutionService:
         )
         try:
             ack = broker.submit_order(broker_request)
-        except TimeoutError as exc:
-            snapshot = broker.query_order_by_client_id(intent["client_order_id"])
+        except (PermissionError, ValueError) as exc:
+            # 明确的业务拒单（安全守卫拒绝/未启用/参数非法/资金或持仓不足/陈旧行情）：
+            # 确定未成交，安全置 REJECTED 终态，并发布 ORDER_REJECTED 触发告警（oms-6）。
+            # 约定：真实券商适配器仅在“确认未送达/已拒”时抛 PermissionError/ValueError，
+            # 连接/超时等不确定异常应抛 TimeoutError 或其它异常，走下面的 UNKNOWN 路径。
+            order = store.update_live_order(
+                order["order_id"], status="REJECTED", last_error=str(exc)
+            )
+            self._publish_order_rejected(intent, str(exc))
+            self._refresh_strategy(intent["run_id"])
+            raise
+        except Exception as exc:
+            # 任何 I/O 层异常（超时/连接重置/HTTP 5xx/解析失败……）：订单可能已送达券商
+            # 并成交，绝不能当作“已拒”。先按 client_order_id 查询确认；无法确认则保留
+            # UNKNOWN 并告警，禁止盲目重发或误判终态（oms-6/oms-7）。
+            snapshot = None
+            try:
+                snapshot = broker.query_order_by_client_id(intent["client_order_id"])
+            except Exception:
+                snapshot = None
             if snapshot:
                 order = self._apply_snapshot(order["order_id"], snapshot)
             else:
                 order = store.update_live_order(
-                    order["order_id"],
-                    status="UNKNOWN",
-                    last_error=str(exc),
+                    order["order_id"], status="UNKNOWN", last_error=str(exc)
+                )
+                alert_service.send(
+                    "实盘下单异常，订单状态未知（UNKNOWN）",
+                    "intent={} client_order_id={} 错误={}".format(
+                        intent_id, intent["client_order_id"], exc
+                    ),
+                    severity="critical",
+                    dedup_key="submit_unknown:{}".format(intent["client_order_id"]),
                 )
             self._refresh_strategy(intent["run_id"])
-            return {"idempotent": False, "order": order, "timeout": True}
-        except Exception as exc:
-            order = store.update_live_order(
-                order["order_id"],
-                status="REJECTED",
-                last_error=str(exc),
-            )
-            self._refresh_strategy(intent["run_id"])
-            raise
+            return {"idempotent": False, "order": order, "uncertain": True}
 
         order = store.update_live_order(
             order["order_id"],
@@ -238,6 +275,49 @@ class LiveExecutionService:
         )
         self._refresh_strategy_for_order(result)
         return {"idempotent": False, "order": result}
+
+    def recover_active_orders(
+        self, broker: Optional[BrokerAdapter] = None
+    ) -> Dict[str, Any]:
+        """把本地中间态实盘订单收敛到券商真值（启动恢复 + 周期巡检，oms-1/oms-2）。
+
+        逐笔按 client_order_id 查询券商并 _apply_snapshot 收敛；仍无法确认的 UNKNOWN
+        单会告警提醒人工核查，杜绝“崩溃重启后中间态订单永久悬挂、无人知晓”。
+        """
+        broker = broker or get_broker()
+        recovered = 0
+        unresolved: list = []
+        for order in store.list_live_orders(statuses=RECOVERABLE_LIVE_STATUSES):
+            snapshot = None
+            try:
+                snapshot = broker.query_order_by_client_id(order["client_order_id"])
+            except Exception:
+                snapshot = None
+            if snapshot:
+                result = self._apply_snapshot(order["order_id"], snapshot)
+                self._refresh_strategy_for_order(result)
+                recovered += 1
+            else:
+                # 任何可恢复中间态（UNKNOWN/CANCEL_FAILED/SUBMITTING…）在券商查不到真值时
+                # 都计为“待人工核查”，不能只盯 UNKNOWN——这些恰是最危险的“可能已成交但
+                # 本地不知道”的单，必须告警而非静默跳过。
+                unresolved.append(
+                    "{}({})".format(order["client_order_id"], order["status"])
+                )
+        if unresolved:
+            preview = "、".join(unresolved[:10])
+            alert_service.send(
+                "实盘存在无法收敛的中间态订单",
+                "{} 笔查询券商仍无法确认状态，需人工核查：{}".format(
+                    len(unresolved), preview
+                ),
+                severity="critical",
+                # dedup_key 纳入笔数与订单集合指纹，规模/集合变化能再次触达。
+                dedup_key="recover_unresolved:{}:{}".format(
+                    len(unresolved), hash(tuple(sorted(unresolved)))
+                ),
+            )
+        return {"recovered": recovered, "still_unknown": len(unresolved)}
 
     def sync_broker(
         self, broker: Optional[BrokerAdapter] = None
@@ -334,6 +414,22 @@ class LiveExecutionService:
             )
             raise PermissionError("订单内容已变化，必须重新审批")
         return approval
+
+    @staticmethod
+    def _publish_order_rejected(intent: Dict[str, Any], reason: str) -> None:
+        """实盘订单被拒时发布 ORDER_REJECTED 事件，触发企业微信告警（live-reject-no-alert）。"""
+        from quantdev.services.events import EventType, event_bus
+
+        event_bus.publish(
+            event_type=EventType.ORDER_REJECTED,
+            aggregate_type="live_order",
+            aggregate_id=intent["client_order_id"],
+            payload={
+                "intent_id": intent["intent_id"],
+                "client_order_id": intent["client_order_id"],
+                "reason": reason,
+            },
+        )
 
     @staticmethod
     def _apply_snapshot(order_id: str, snapshot) -> Dict[str, Any]:

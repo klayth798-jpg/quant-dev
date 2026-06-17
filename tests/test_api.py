@@ -562,6 +562,27 @@ def test_admin_write_requires_matching_key(monkeypatch):
         assert ok.status_code == 200
 
 
+def test_operator_keys_bind_identity_to_credential(monkeypatch):
+    """每操作员独立密钥：身份由密钥反查派生，忽略客户端可伪造的 X-Operator（MC-1）。"""
+    from fastapi import HTTPException
+    from quantdev.api import require_admin
+
+    monkeypatch.setattr(
+        api_module,
+        "settings",
+        replace(
+            api_module.settings,
+            operator_keys={"key-alice": "alice", "key-bob": "bob"},
+            admin_api_key="",
+            admin_allow_insecure=False,
+        ),
+    )
+    assert require_admin(x_admin_key="key-alice", x_operator="forged") == "alice"
+    assert require_admin(x_admin_key="key-bob", x_operator="forged") == "bob"
+    with pytest.raises(HTTPException):
+        require_admin(x_admin_key="wrong", x_operator="x")
+
+
 def test_heavy_post_endpoints_now_guarded(monkeypatch):
     """此前裸奔的重活 POST 现在需要鉴权。"""
     monkeypatch.setattr(

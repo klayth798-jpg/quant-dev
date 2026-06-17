@@ -1,4 +1,5 @@
 import hmac
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any, Dict
@@ -8,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from quantdev.alerting import alert_service, install_event_alerts
 from quantdev.config import PROJECT_ROOT, settings
 from quantdev.db import database
 from quantdev.integrations.broker import get_broker
@@ -30,6 +32,7 @@ from quantdev.services.agent import research_agent_service
 from quantdev.services.backtest import backtest_service
 from quantdev.services.calendar import trading_calendar_service
 from quantdev.services.execution import paper_execution_service
+from quantdev.services.execution_router import execution_router
 from quantdev.services.factors import factor_service
 from quantdev.services.live_execution import live_execution_service
 from quantdev.services.live_guard import live_guard
@@ -49,6 +52,13 @@ def require_admin(
     x_admin_key: str = Header(default=""),
     x_operator: str = Header(default="local-admin"),
 ) -> str:
+    # 每操作员独立密钥（推荐，sec-1/MC-1）：身份由密钥反查派生，不信任客户端自报的
+    # X-Operator 头，使双人复核可信。配置 QUANTDEV_OPERATOR_KEYS 后即取代单一共享 key。
+    if settings.operator_keys:
+        for key, operator in settings.operator_keys.items():
+            if hmac.compare_digest(x_admin_key, key):
+                return operator
+        raise HTTPException(status_code=401, detail="管理员密钥无效")
     if not settings.admin_api_key:
         # 安全默认：未配置管理员密钥时，写操作一律关闭。仅当显式开启
         # QUANTDEV_ALLOW_INSECURE_ADMIN（本地开发/测试）才放行，避免“一字之差全开”。
@@ -75,11 +85,21 @@ def _ensure_demo_results() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.migrate()
+    install_event_alerts()
     market_data_service.ensure_factor_definitions()
     if settings.data_mode == "demo":
         market_data_service.bootstrap_demo_data()
         _ensure_demo_results()
     paper_execution_service.recover_active_orders()
+    # 实盘模式：启动时先收敛本地中间态订单到券商真值，避免重启后 UNKNOWN 永久悬挂。
+    if execution_router.configured_mode() == "live":
+        try:
+            live_execution_service.recover_active_orders()
+        except Exception:  # 恢复失败不阻塞启动，但要告警。
+            logging.getLogger(__name__).exception("实盘订单启动恢复失败")
+            alert_service.send(
+                "实盘订单启动恢复失败", severity="critical", dedup_key="live_recover_fail"
+            )
     yield
 
 
@@ -136,7 +156,7 @@ def readiness() -> Dict[str, Any]:
     return result
 
 
-@app.get("/api/live/guard")
+@app.get("/api/live/guard", dependencies=[Depends(require_admin)])
 def live_guard_status() -> Dict[str, Any]:
     return {
         "broker_mode": live_guard.resolved_broker_mode(),
@@ -159,7 +179,7 @@ def toggle_kill_switch(request: KillSwitchRequest) -> Dict[str, Any]:
     return {"kill_switch": live_guard.kill_switch_status(), "record": record}
 
 
-@app.get("/api/live/broker")
+@app.get("/api/live/broker", dependencies=[Depends(require_admin)])
 def live_broker_snapshot() -> Dict[str, Any]:
     """当前生效 Broker 的健康与账户/持仓/委托/成交查询视图。
 
@@ -191,7 +211,7 @@ def sync_live_broker(_: str = Depends(require_admin)) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.get("/api/live/orders")
+@app.get("/api/live/orders", dependencies=[Depends(require_admin)])
 def list_live_orders() -> Dict[str, Any]:
     return {"items": store.list_live_orders()}
 
@@ -206,12 +226,12 @@ def cancel_live_order(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.get("/api/live/reconciliations")
+@app.get("/api/live/reconciliations", dependencies=[Depends(require_admin)])
 def list_reconciliations(limit: int = Query(default=20, ge=1, le=100)) -> Dict[str, Any]:
     return {"items": store.list_reconciliations(limit=limit)}
 
 
-@app.get("/api/live/reconciliations/{recon_id}")
+@app.get("/api/live/reconciliations/{recon_id}", dependencies=[Depends(require_admin)])
 def get_reconciliation(recon_id: str) -> Dict[str, Any]:
     report = store.get_reconciliation(recon_id)
     if report is None:
@@ -231,7 +251,7 @@ def tradability(symbol: str) -> Dict[str, Any]:
     return asdict(tradability_service.evaluate(symbol))
 
 
-@app.get("/api/events")
+@app.get("/api/events", dependencies=[Depends(require_admin)])
 def list_events(
     limit: int = Query(default=50, ge=1, le=200),
     event_type: str = Query(default=None),
@@ -468,7 +488,7 @@ def risk_check(request: RiskCheckRequest) -> Dict[str, Any]:
     return risk_service.check(request)
 
 
-@app.get("/api/paper/account")
+@app.get("/api/paper/account", dependencies=[Depends(require_admin)])
 def paper_account() -> Dict[str, Any]:
     return paper_execution_service.get_account()
 
@@ -597,10 +617,10 @@ def reject_strategy_intent(
 
 @app.post("/api/strategies/intents/{intent_id}/submit")
 def submit_strategy_intent(
-    intent_id: str, _: str = Depends(require_admin)
+    intent_id: str, actor: str = Depends(require_admin)
 ) -> Dict[str, Any]:
     try:
-        return live_execution_service.submit_intent(intent_id)
+        return live_execution_service.submit_intent(intent_id, actor=actor)
     except (PermissionError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

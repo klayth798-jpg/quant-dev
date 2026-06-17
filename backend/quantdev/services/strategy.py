@@ -4,6 +4,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from quantdev.alerting import alert_service
 from quantdev.config import settings
 from quantdev.db import database
 from quantdev.models import StrategyConfigRequest
@@ -37,6 +38,7 @@ INTENT_TERMINAL_STATUSES = {
 
 class StrategyRunnerService:
     lease_key = "strategy-runner"
+    _last_reconcile: Optional[float] = None  # 上次定时对账的 monotonic 时间
 
     def create(self, request: StrategyConfigRequest) -> Dict[str, Any]:
         if not store.get_factor(request.factor_id):
@@ -484,7 +486,25 @@ class StrategyRunnerService:
 
                 paper_execution_service.recover_active_orders()
             elif execution_router.configured_mode() == "live":
-                live_execution_service.sync_broker()
+                # 每轮：同步券商→收敛中间态订单→按间隔自动对账（oms-1/recon-2）。
+                # 三步彼此隔离：任一步骤的瞬时异常都不应拖垮其它步骤与策略执行，且要告警，
+                # 不能像旧实现那样一个查询异常静默中断整轮。
+                for step in (
+                    live_execution_service.sync_broker,
+                    live_execution_service.recover_active_orders,
+                    self._maybe_reconcile,
+                ):
+                    try:
+                        step()
+                    except Exception:
+                        name = getattr(step, "__name__", str(step))
+                        LOGGER.exception("实盘运行器步骤失败: %s", name)
+                        alert_service.send(
+                            "实盘运行器步骤失败",
+                            "step={}".format(name),
+                            severity="high",
+                            dedup_key="runner_step_fail:{}".format(name),
+                        )
             results = []
             for strategy in self.list():
                 if not store.renew_lease(
@@ -506,6 +526,26 @@ class StrategyRunnerService:
         finally:
             store.release_lease(self.lease_key, owner)
 
+    def _maybe_reconcile(self) -> None:
+        """按 reconciliation_interval_seconds 固定间隔自动对账（recon-2）。
+
+        实盘对账不能只靠人工手动触发：在 live runner 每轮 sync 后按间隔触发一次，
+        BREAK 会经事件总线触发企业微信告警并按配置自动激活 Kill Switch。
+        """
+        now = time.monotonic()
+        if (
+            self._last_reconcile is not None
+            and now - self._last_reconcile < settings.reconciliation_interval_seconds
+        ):
+            return
+        self._last_reconcile = now
+        try:
+            from quantdev.services.reconciliation import reconciliation_service
+
+            reconciliation_service.run()
+        except Exception:
+            LOGGER.exception("定时对账失败")
+
     def loop(self) -> None:
         failures = 0
         while True:
@@ -526,6 +566,12 @@ class StrategyRunnerService:
                     resource_type="system",
                     resource_id=self.lease_key,
                     payload={"error": str(exc), "retry_seconds": delay},
+                )
+                alert_service.send(
+                    "策略运行器循环失败",
+                    "连续失败 {} 次，{}s 后重试；错误：{}".format(failures, delay, exc),
+                    severity="high",
+                    dedup_key="runner_loop_fail",
                 )
             time.sleep(delay)
 
