@@ -1,33 +1,40 @@
 # Quant Dev 项目代码讲解
 
-本文档对应 2026 年 6 月 9 日的代码状态，面向后续开发、排错和功能扩展。
+本文档对应 2026 年 6 月 15 日的代码状态，面向后续开发、排错和功能扩展。
 
 ## 1. 项目定位
 
 Quant Dev 当前是一个模块化单体量化系统，已经打通以下链路：
 
 ```text
-Tinyshare/Tushare 真实数据
+Tinyshare/Tushare 真实数据与盘中行情
   -> 本地研究数据库
   -> 因子计算与评估
   -> 事件式策略回测
   -> 组合风险检查
-  -> 模拟订单和资金持仓账本
+  -> 策略运行器和幂等订单意图
+  -> Paper/Live 执行路由
+  -> 持久化审批、预交易硬风控与 OMS
+  -> 模拟账本或真实 Broker
+  -> 同步、对账和 Kill Switch
   -> 只读研究 Agent
 ```
 
-当前系统可以用于因子研究、成本后回测、风险规则验证和模拟交易，但还不是可直接连接券商的生产实盘系统。实盘 Broker 在代码层禁用。
+当前系统可以用于因子研究、成本后回测、风险规则验证、自动模拟交易和真实 Broker
+适配器接入。仓库已经具备实盘状态机，但真实券商连接仍需按最终券商实现；Mock Broker
+只用于异常压测，`live` 模式绝不会自动回退到 Mock。
 
-截至 2026 年 6 月 9 日，当前本地数据库大致包含：
+截至 2026 年 6 月 13 日，当前活动行情结束于 2026 年 6 月 10 日。6 月 13 日是周六，
+最近完整交易日为 6 月 12 日，因此进入下一次模拟盘前还需同步 6 月 11 日和 6 月 12 日。
 
 | 数据 | 数量 |
 | --- | ---: |
-| 证券主数据 | 7,077 |
-| 日线行情 | 4,420,152 |
-| 有行情股票 | 5,661 |
-| 行情交易日 | 828 |
-| 行情区间 | 2023-01-03 至 2026-06-08 |
-| 每日指标 | 4,420,152 |
+| 证券主数据 | 7,078 |
+| 日线行情 | 4,431,179 |
+| 有行情股票 | 5,662 |
+| 行情交易日 | 830 |
+| 行情区间 | 2023-01-03 至 2026-06-10 |
+| 每日指标 | 4,431,179 |
 | 财务指标 | 99,938 |
 | 指数历史成分 | 77,701 |
 | 因子定义 | 5 |
@@ -41,23 +48,30 @@ Tinyshare/Tushare 真实数据
 ```mermaid
 flowchart LR
     UI["零构建 Web 工作台"] --> API["FastAPI API"]
-    API --> SYNC["TushareSyncService"]
-    API --> FACTOR["FactorService"]
-    API --> BACKTEST["BacktestService"]
+    API --> REDIS["Redis Queue"]
+    REDIS --> WORKER["Task Worker"]
+    WORKER --> SYNC["TushareSyncService"]
+    WORKER --> FACTOR["FactorService"]
+    WORKER --> BACKTEST["BacktestService"]
     API --> RISK["RiskService"]
-    API --> PAPER["PaperExecutionService"]
+    API --> STRATEGY["StrategyRunnerService"]
+    STRATEGY --> ROUTER["ExecutionRouter"]
+    ROUTER --> PAPER["PaperExecutionService"]
+    ROUTER --> LIVE["LiveExecutionService"]
+    LIVE --> BROKER["BrokerAdapter"]
     API --> AGENT["ResearchAgentService"]
     SYNC --> PROVIDER["Tinyshare / Tushare SDK"]
-    SYNC --> DB[("SQLite")]
+    SYNC --> DB[("PostgreSQL / SQLite")]
     FACTOR --> DB
     BACKTEST --> DB
     RISK --> DB
     PAPER --> DB
+    LIVE --> DB
     AGENT --> DB
-    PAPER -. "当前禁用" .-> LIVE["Live Broker"]
 ```
 
-选择模块化单体的原因是当前阶段更重视研究闭环、可调试性和较低运维成本。各领域服务已经分离，未来可以把数据同步、因子计算和回测迁移到独立 Worker。
+系统仍保持模块化单体代码库，但运行时已经拆分为 API、任务 Worker、策略运行器、
+PostgreSQL 和 Redis。数据同步、因子计算和回测不再占用 Web 进程。
 
 ## 3. 启动过程
 
@@ -79,14 +93,15 @@ FastAPI 生命周期启动时依次执行：
 backend/quantdev/
   api.py                         HTTP 路由、生命周期、静态前端入口
   analytics.py                   收益、回撤、夏普、相关性等统计函数
-  cli.py                         数据库、样例和真实同步命令
+  cli.py                         数据库、Worker、样例和真实同步命令
   config.py                      环境变量与路径配置
-  db.py                          SQLite 连接、事务、表结构和索引
+  db.py                          SQLite/PostgreSQL 连接、事务和版本化迁移
+  data_migration.py              SQLite 到 PostgreSQL 的 COPY 批量迁移
   models.py                      Pydantic API 请求模型
   store.py                       SQL 查询、持久化与审计封装
   integrations/
     market_data.py               Tinyshare/Tushare SDK 适配器
-    broker.py                    实盘 Broker 禁用边界
+    broker.py                    Broker 协议、Mock 和真实适配器加载边界
   services/
     market.py                    样例数据、因子定义和真实库重置
     tushare_sync.py              真实市场数据同步
@@ -94,7 +109,16 @@ backend/quantdev/
     backtest.py                  A 股事件式回测
     risk.py                      组合硬风控
     execution.py                 模拟订单、成交和账户账本
+    execution_router.py          Paper/Live 执行路由
+    pretrade.py                  实盘报单前硬风控
+    live_execution.py            审批、实盘订单、撤单和 Broker 同步
+    quotes.py                    实时行情接收、时效与日线降级
+    strategy.py                  策略配置、最新截面、目标仓位和订单意图
+    calendar.py                  交易日与交易时段失败关闭
+    reconciliation.py            本地账本与 Broker 对账
+    readiness.py                 五阶段实盘就绪度
     agent.py                     只读研究 Agent
+    tasks.py                     Redis 投递、任务抢占、重试、恢复和 Worker
 
 frontend/
   index.html                     应用外壳和导航
@@ -105,6 +129,8 @@ tests/
   conftest.py                    每个测试创建隔离 SQLite 样例库
   test_api.py                    API 回归测试
   test_services.py               因子、回测、风控、订单和 Agent 测试
+  test_strategy_runner.py        策略恢复、租约和意图执行测试
+  test_live_execution.py         实盘审批、幂等和失败关闭测试
   test_tushare_sync.py           真实数据同步适配测试
 ```
 
@@ -117,6 +143,12 @@ tests/
 | `QUANTDEV_ENV` | `development` | 运行环境名称 |
 | `QUANTDEV_DATA_MODE` | `demo` | `demo` 或 `real` |
 | `QUANTDEV_DATABASE_PATH` | `./data/quantdev.db` | SQLite 文件 |
+| `QUANTDEV_DATABASE_BACKEND` | `sqlite` | `sqlite` 或 `postgresql` |
+| `QUANTDEV_DATABASE_URL` | 空 | PostgreSQL DSN |
+| `QUANTDEV_TASK_BACKEND` | `inline` | 本地 `inline` 或生产 `redis` |
+| `QUANTDEV_REDIS_URL` | 本机 Redis | Redis 连接地址 |
+| `QUANTDEV_TASK_MAX_ATTEMPTS` | `3` | Worker 最大尝试次数 |
+| `QUANTDEV_TASK_VISIBILITY_TIMEOUT_SECONDS` | `1800` | 运行中任务超时恢复阈值 |
 | `QUANTDEV_LOG_LEVEL` | `INFO` | 日志级别预留 |
 | `MARKET_DATA_SDK` | `tushare` | `tushare` 或 `tinyshare` |
 | `TUSHARE_TOKEN` | 空 | 官方 Tushare Token |
@@ -126,6 +158,20 @@ tests/
 | `TUSHARE_DEFAULT_INDICES` | 三个中证指数 | 默认同步指数 |
 | `DEEP_RESEARCH_BASE_URL` | 空 | 外部研究 Agent 地址预留 |
 | `DEEP_RESEARCH_API_KEY` | 空 | 外部研究 Agent 鉴权预留 |
+| `QUANTDEV_BROKER_MODE` | `disabled` | `disabled`、`paper` 或 `live` |
+| `QUANTDEV_BROKER_ADAPTER` | 空 | 真实适配器工厂，格式 `module:factory` |
+| `QUANTDEV_BROKER_DRY_RUN` | `true` | 查询真实 Broker 但不发送真实报单/撤单 |
+| `QUANTDEV_PAPER_ENFORCE_SESSION` | `true` | 模拟实盘是否限制交易时段 |
+| `QUANTDEV_PAPER_QUOTE_MODE` | `realtime` | `realtime` 或收盘后验证用 `eod` |
+| `QUANTDEV_QUOTE_MAX_AGE_SECONDS` | `15` | 盘中行情最大年龄 |
+| `QUANTDEV_QUOTE_MAX_SPREAD_BPS` | `100` | 买一卖一最大允许价差 |
+| `QUANTDEV_MAX_DAILY_LOSS` | `1000` | 日亏损熔断金额 |
+| `QUANTDEV_APPROVAL_TTL_SECONDS` | `300` | 实盘人工审批有效期 |
+| `QUANTDEV_RUNNER_LEASE_SECONDS` | `60` | 策略运行器租约时长 |
+| `QUANTDEV_RECONCILIATION_MAX_AGE_MINUTES` | `1440` | 就绪度允许的对账最大年龄 |
+| `QUANTDEV_READ_API_KEY` | 空 | 业务读接口只读密钥，生产 Compose 强制配置 |
+| `QUANTDEV_ADMIN_API_KEY` | 空 | 写接口管理员密钥 |
+| `QUANTDEV_OPERATOR_KEYS` | 空 | 操作员密钥，格式 `alice:keyA,bob:keyB` |
 
 授权码只应保存在本地 `.env` 或部署密钥系统中，不应出现在源码、文档、日志或 Git 历史里。
 
@@ -144,6 +190,7 @@ tests/
 | `indices` | 指数定义 | `index_code` |
 | `index_constituents` | 指数历史成分和权重 | `index_code, symbol, trade_date` |
 | `data_sync_runs` | 同步参数、状态、统计和错误 | `run_id` |
+| `dataset_manifests` | 数据水位、行数、同步任务和密封状态 | `manifest_id` |
 
 行情、每日指标和指数成分已经建立日期与标的复合索引，用于减少大表扫描和临时排序。
 
@@ -161,10 +208,23 @@ tests/
 
 | 表 | 作用 |
 | --- | --- |
-| `paper_accounts` | 初始资金、现金和账户状态 |
-| `paper_positions` | 数量和含费用平均成本 |
-| `paper_orders` | 幂等委托和订单状态 |
+| `paper_accounts` | 现金、冻结现金、初始资金和账户状态 |
+| `paper_positions` | 数量、T+1 冻结、委托冻结和平均成本 |
+| `paper_orders` | 幂等委托、状态、成交量、冻结和策略关联 |
 | `paper_fills` | 成交价格、数量和费用 |
+| `order_events` | 单笔订单事务内事件流 |
+| `account_daily_snapshots` | 日初净值、当前净值和日盈亏 |
+| `market_quotes` | 最新盘中行情及接收时间 |
+| `market_quote_history` | 盘中行情历史和接收留痕 |
+| `strategy_configs` | 策略参数与启停状态 |
+| `strategy_runs` | 每策略每日唯一运行 |
+| `strategy_targets` | 因子分数和目标仓位 |
+| `order_intents` | 策略到订单的幂等意图 |
+| `order_approvals` | 审批人、理由、请求哈希、有效期和撤销状态 |
+| `live_orders` / `live_trades` | 本地实盘 OMS 委托和成交状态 |
+| `live_account_state` / `live_positions` | 最近一次 Broker 资金持仓快照 |
+| `system_leases` | 防止多个运行器重复执行 |
+| `mock_broker_*` | 持久化 Mock 账户、持仓、订单和成交 |
 
 ## 7. 真实数据同步
 
@@ -210,9 +270,11 @@ else:
 
 系统按交易日检查行情和每日指标是否已存在，存在则跳过。指数成分按指数与月份检查，重复运行不会产生重复主键。
 
-当前真实数据使用固定 ID，例如 `tinyshare-cn-equity-live-v1`。这个 ID 对增量同步是方便的，但它代表的是持续变化的活动数据集，不是真正不可变快照。旧回测虽然保存了 `snapshot_id`，仍可能在后续同步后无法逐字节复现。
+当前真实数据仍使用活动快照 ID，例如 `tinyshare-cn-equity-live-v1`。每次成功同步会生成
+密封 `dataset_manifest`，保存数据区间、关键表行数、同步任务和创建时间；回测与策略
+运行同时保存 `snapshot_id` 和 `manifest_id`，避免只靠一个持续变化的名称定位数据。
 
-生产化时应改为：
+这已经提供数据水位级复现，但底层 SQLite 活动表仍可能被数据修订覆盖。要求逐字节复现时应：
 
 1. 每次同步生成不可变批次或数据版本。
 2. 研究任务保存数据水位、版本清单或 Parquet Manifest。
@@ -360,7 +422,7 @@ backtest_price = raw_close * adj_factor / latest_adj_factor
 
 `RiskService.evaluate()` 只计算结果，`RiskService.check()` 还会把违规写入 `risk_events`。模拟买单复用 `evaluate()`，并在拒绝后记录风险事件。
 
-## 11. 模拟 OMS 与账本
+## 11. OMS、审批与账本
 
 模拟账户初始资金为 1,000,000 元。
 
@@ -370,12 +432,12 @@ backtest_price = raw_close * adj_factor / latest_adj_factor
 2. 使用 `client_order_id` 检查幂等。
 3. 相同 ID 和相同请求直接返回原订单。
 4. 相同 ID 和不同请求直接拒绝。
-5. 读取最新研究行情并计算滑点后价格。
+5. 检查交易日历、连续竞价时段和实时行情年龄。
 6. 买单计算成交后的组合权重，并执行统一硬风控。
 7. 检查现金或可卖持仓。
-8. 写订单，成交后原子更新资金、持仓和成交记录。
+8. 使用 `BEGIN IMMEDIATE` 串行写订单、资金、持仓、成交和订单事件。
 
-市价单按最新收盘价加减滑点即时成交。
+市价单默认只接受 `market_quotes` 中的新鲜盘中行情；`eod` 模式仅用于收盘后验证。
 
 限价单规则：
 
@@ -383,9 +445,40 @@ backtest_price = raw_close * adj_factor / latest_adj_factor
 - 卖出限价小于等于最新价时可成交。
 - 不可成交时状态为 `OPEN`。
 
-当前 `OPEN` 订单不会在后续行情到达时自动撮合，也不会冻结现金或持仓，还没有撤单接口。生产 OMS 需要补充订单状态机、部分成交、冻结、撤单、T+1 可卖数量和成交回报。
+`OPEN` 买单冻结现金，卖单冻结可卖数量。`POST /api/paper/match`、服务启动和后台
+运行器会重新撮合；撤单释放冻结。买入成交保存下一交易日作为 T+1 解冻日。
 
-## 12. 研究 Agent
+账户每日保存日初和当前净值，日亏损达到阈值会立即激活 Kill Switch。订单、目标仓位
+和策略运行均有持久化关联，可从 `strategy_run -> order_intent -> paper_order ->
+paper_fill` 完整追溯。
+
+实盘链路由 `ExecutionRouter` 和 `LiveExecutionService` 负责：
+
+1. 策略先生成不可重复的 `order_intent`，不直接调用券商。
+2. 开启人工审批时，审批记录保存操作人、理由、请求哈希和过期时间。
+3. 提交时重新计算请求哈希，并执行行情、价差、时钟、限价、资金、可卖数量、组合风险、
+   日亏损、Kill Switch 和 Broker 健康检查。
+4. 本地先保存 `SUBMITTING`，再调用 Broker；超时后按 `client_order_id` 查询，未确认则
+   保持 `UNKNOWN`，不直接重发。
+5. `sync_broker()` 把券商委托、成交、资金和持仓同步到本地实盘状态表。
+6. 对账比较本地快照与 Broker 快照，差异可自动激活 Kill Switch。
+
+## 12. 策略运行器
+
+`StrategyRunnerService` 执行以下流程：
+
+1. 获取系统租约，保证同一时刻只有一个运行器。
+2. 检查交易时钟和最近完整交易日。
+3. 要求活动快照的最大日期等于信号日期。
+4. 只读取每只股票最近 21 条行情计算最新因子截面。
+5. 按指数时点股票池、因子排名和 `top_n` 生成等金额目标。
+6. 保存 `strategy_targets` 和确定性 `order_intents`。
+7. 先卖后买，通过执行路由进入 Paper OMS 或 Live OMS。
+8. 每策略每日唯一运行；失败、部分完成或活动运行可恢复，已有意图不会重复创建。
+9. 运行器持有可续租的系统租约，租约丢失时停止本轮，循环异常使用指数退避。
+10. 策略运行和回测都保存对应的 `manifest_id`。
+
+## 13. 研究 Agent
 
 Agent 是系统中的分析层，不是交易执行层。
 
@@ -405,7 +498,7 @@ Agent 是系统中的分析层，不是交易执行层。
 
 当前 Agent 仍是本地模板式分析。配置外部研究服务后只切换为 `remote-ready` 标记，远程调用本身尚未实现。
 
-## 13. API 清单
+## 14. API 清单
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
@@ -421,6 +514,8 @@ Agent 是系统中的分析层，不是交易执行层。
 | GET | `/api/data/financials/{symbol}` | 单只股票财务指标 |
 | GET | `/api/market/prices` | 单只股票最近行情 |
 | GET | `/api/factors` | 因子定义和最近评估 |
+| GET | `/api/factors/{factor_id}/scores` | 读取最新因子截面缓存 |
+| POST | `/api/factors/{factor_id}/scores/refresh` | 后台刷新最新因子截面缓存 |
 | POST | `/api/factors/{factor_id}/evaluate` | 因子评估 |
 | GET | `/api/backtests` | 回测列表 |
 | POST | `/api/backtests` | 运行回测 |
@@ -428,12 +523,33 @@ Agent 是系统中的分析层，不是交易执行层。
 | POST | `/api/risk/check` | 组合风险检查 |
 | GET | `/api/paper/account` | 模拟账户 |
 | POST | `/api/paper/orders` | 模拟委托 |
+| POST | `/api/paper/orders/{order_id}/cancel` | 撤销模拟挂单 |
+| POST | `/api/paper/match` | 触发挂单撮合 |
+| GET/POST | `/api/live/quotes` | 查询或注入盘中行情 |
+| GET/POST | `/api/strategies` | 查询或创建策略 |
+| POST | `/api/strategies/{id}/enabled` | 启停策略 |
+| POST | `/api/strategies/run` | 手动运行策略 |
+| GET | `/api/strategies/runs` | 策略运行记录 |
+| GET | `/api/strategies/runs/{run_id}` | 目标和订单意图详情 |
+| POST | `/api/strategies/intents/{intent_id}/approve` | 持久化批准实盘意图 |
+| POST | `/api/strategies/intents/{intent_id}/reject` | 拒绝实盘意图 |
+| POST | `/api/strategies/intents/{intent_id}/submit` | 预交易检查后发送 Broker |
+| GET | `/api/live/orders` | 本地实盘订单状态 |
+| POST | `/api/live/orders/{order_id}/cancel` | 撤销实盘订单 |
+| POST | `/api/live/sync` | 同步 Broker 委托、成交和账户 |
+| POST | `/api/live/kill-switch` | 激活或解除熔断 |
+| POST | `/api/live/reconcile` | 执行 Broker 对账 |
+| GET | `/api/live/readiness` | 五阶段就绪度 |
 | POST | `/api/agent/research` | 只读研究分析 |
 | GET | `/api/system/requirements` | 外部 API 配置状态 |
 
 Swagger 文档位于 `/docs`。
 
-## 14. 测试与质量检查
+配置 `QUANTDEV_READ_API_KEY` 后，业务读接口要求 `X-Read-Key`，管理员/操作员密钥也可读取。
+写接口要求 `X-Admin-Key`；配置 `QUANTDEV_OPERATOR_KEYS` 后，审批与提交的 actor 由密钥反查
+绑定，不信任客户端自报身份。
+
+## 15. 测试与质量检查
 
 测试使用临时 SQLite 数据库，每个测试自动迁移并生成固定样例数据，不会修改真实库。
 
@@ -447,6 +563,13 @@ Swagger 文档位于 `/docs`。
 - 模拟订单成交和幂等。
 - 不可成交限价单保持 `OPEN`。
 - 模拟买单复用组合风控。
+- 挂单冻结与撤单释放。
+- 行情过期拒单、T+1 和日亏损熔断。
+- 策略运行计划持久化与每日幂等。
+- 策略失败恢复、租约续期和订单状态回写。
+- 实盘审批哈希、审批失效、报单超时 UNKNOWN 和禁止盲重试。
+- `live` 模式未配置适配器时不回退到 Mock Broker。
+- Mock Broker 超时 UNKNOWN、部分成交和终态撤单。
 - Agent 不具备写订单权限。
 - Tinyshare/Tushare 同步转换。
 
@@ -455,18 +578,19 @@ Swagger 文档位于 `/docs`。
 ```bash
 make test
 make lint
+make verify-broker
 git diff --check
 ```
 
-## 15. 当前主要风险与优化路线
+## 16. 当前主要风险与优化路线
 
 ### P0: 实盘前必须完成
 
-1. 不可变数据快照和回测数据版本。
+1. 按最终券商实现真实 `BrokerAdapter`、回报推送和测试环境契约测试。
 2. 历史 ST、停复牌、交易状态和官方涨跌停价格。
-3. T+1 可卖数量、冻结资金、撤单、部分成交和订单恢复。
-4. 身份认证、权限控制、CSRF 防护、限流和审计查询。
-5. Broker 适配、Kill Switch、人工审批和每日对账。
+3. 将 Manifest 进一步落为不可变 Parquet 数据分区和校验和。
+4. 将 API Key 和单操作员审批升级为正式身份认证、RBAC、双人审批、CSRF 和限流。
+5. SQLite 迁移 PostgreSQL，使用版本化迁移和高可用部署。
 6. Walk-forward、样本外检验和生存者偏差检查。
 
 ### P1: 数据与计算规模
@@ -492,7 +616,7 @@ git diff --check
 2. 应增加服务端分页、代码搜索和虚拟列表。
 3. 回测应异步执行并提供进度、取消和日志。
 4. 因子评估应展示完整指标、参数和历史版本。
-5. 模拟盘应提供订单详情、撤单、成交记录和风险事件页面。
+5. 增加订单事件、成交明细、对账差异和行情源监控页面。
 
 ### P2: 工程治理
 
@@ -501,7 +625,7 @@ git diff --check
 3. 增加 API 契约测试和大数据性能基准。
 4. 拆分前端 `app.js`，按页面和 API Client 分模块。
 
-## 16. 开发流程
+## 17. 开发流程
 
 ### 首次安装
 
@@ -523,7 +647,19 @@ make dev
 ```bash
 .venv/bin/python -m quantdev.cli sync-market \
   --start-date 2025-01-02 \
-  --end-date 2026-06-08
+  --end-date 2026-06-10
+```
+
+### 启动策略运行器
+
+```bash
+make paper-runner
+```
+
+Docker 中使用：
+
+```bash
+docker compose --profile paper-live up -d
 ```
 
 ### 扩展新因子
@@ -542,4 +678,3 @@ make dev
 4. 在同步服务中转换单位和空值。
 5. 在 Store 中增加结构化查询。
 6. 添加假适配器测试，避免单元测试访问外网。
-

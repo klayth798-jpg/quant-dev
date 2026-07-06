@@ -58,12 +58,15 @@ def _order(client_order_id: str = "stress-1") -> BrokerOrder:
     )
 
 
-def test_timeout_leaves_no_local_order(live_enabled):
-    """超时必须抛 TimeoutError，且不得在 broker 端登记任何订单（状态未知）。"""
+def test_timeout_persists_unknown_order(live_enabled):
+    """超时必须保留 UNKNOWN 委托，防止调用方误判为未下单并重复提交。"""
     broker = MockLiveBroker(scenario="timeout")
     with pytest.raises(TimeoutError):
         broker.submit_order(_order())
-    assert broker.get_orders() == []
+    orders = broker.get_orders()
+    assert len(orders) == 1
+    assert orders[0].status == "UNKNOWN"
+    assert broker.query_order_by_client_id("stress-1") == orders[0]
     assert broker.health_check().healthy is False
 
 
@@ -108,15 +111,15 @@ def test_cancel_failure_does_not_flip_status(live_enabled):
     assert cancel.status == "CANCEL_FAILED"
 
 
-def test_normal_cancel_succeeds_and_reflects_in_query(live_enabled):
-    """正常场景：下单成交后可成功撤单（状态机走到 CANCELLED）。"""
+def test_filled_order_cannot_be_cancelled(live_enabled):
+    """已成交订单是终态，券商必须拒绝撤单，不能篡改成交事实。"""
     broker = MockLiveBroker(scenario="normal")
     ack = broker.submit_order(_order())
     assert ack.status == "FILLED"
     cancel = broker.cancel_order(ack.broker_order_id)
-    assert cancel.accepted is True
-    assert cancel.status == "CANCELLED"
-    assert broker.query_order(ack.broker_order_id).status == "CANCELLED"
+    assert cancel.accepted is False
+    assert cancel.status == "FILLED"
+    assert broker.query_order(ack.broker_order_id).status == "FILLED"
 
 
 def test_cancel_timeout_raises(live_enabled):

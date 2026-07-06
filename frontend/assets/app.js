@@ -8,16 +8,35 @@ const state = {
   dataStatus: null,
   indices: [],
   paperAccount: null,
+  liveGuard: null,
+  marketClock: null,
+  readiness: null,
+  strategies: [],
+  strategyRuns: [],
+  activeStrategyRun: null,
   activeBacktest: null,
+  explorer: {
+    tab: "prices",
+    symbol: "600519.SH",
+    prices: null,
+    financials: null,
+    factorId: "",
+    factorScores: null,
+    screenIndustry: "",
+    screenKeyword: "",
+    screenSort: "symbol",
+  },
 };
 
 const viewMeta = {
   overview: ["WORKSPACE / OVERVIEW", "量化研究总览"],
   data: ["RESEARCH / DATA", "数据中心"],
+  explorer: ["RESEARCH / EXPLORER", "数据浏览"],
   factors: ["RESEARCH / FACTORS", "因子实验室"],
   backtest: ["RESEARCH / BACKTEST", "策略回测"],
   risk: ["PORTFOLIO / RISK", "风险检查"],
   paper: ["EXECUTION / PAPER", "模拟交易"],
+  strategy: ["EXECUTION / STRATEGY", "策略运行"],
   agent: ["RESEARCH / AGENT", "研究 Agent"],
 };
 
@@ -55,8 +74,17 @@ function showToast(message, type = "info") {
 }
 
 async function api(path, options = {}) {
+  const adminKey = window.localStorage.getItem("quantdevAdminKey") || "";
+  const readKey = window.localStorage.getItem("quantdevReadKey") || "";
+  const operator = window.localStorage.getItem("quantdevOperator") || "local-admin";
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(readKey ? { "X-Read-Key": readKey } : {}),
+      ...(adminKey ? { "X-Admin-Key": adminKey } : {}),
+      "X-Operator": operator,
+      ...(options.headers || {}),
+    },
     ...options,
   });
   const payload = await response.json().catch(() => ({}));
@@ -64,6 +92,18 @@ async function api(path, options = {}) {
     throw new Error(payload.detail || "请求失败");
   }
   return payload;
+}
+
+async function waitForTask(taskId, message = "任务执行中") {
+  for (;;) {
+    const task = await api(`/api/tasks/${taskId}`);
+    if (task.status === "COMPLETED") return task.result;
+    if (task.status === "FAILED") {
+      throw new Error(task.error_message || "任务执行失败");
+    }
+    showToast(`${message}，第 ${task.attempts || 0} 次尝试`);
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+  }
 }
 
 async function loadCoreData() {
@@ -76,16 +116,30 @@ async function loadCoreData() {
     paperAccount,
     dataStatus,
     indices,
-  ] = await Promise.all([
-    api("/api/dashboard"),
-    api("/api/factors"),
-    api("/api/backtests"),
-    api("/api/instruments"),
-    api("/api/system/requirements"),
-    api("/api/paper/account"),
-    api("/api/data/status"),
-    api("/api/data/indices"),
-  ]);
+    liveGuard,
+    marketClock,
+    readiness,
+    strategies,
+    strategyRuns,
+  ] = (
+    // 用 allSettled 优雅降级：未输入 admin key 时受保护接口(账户/guard)会 401/503，
+    // 不应拖垮整个首屏；失败项回退到安全默认，对应面板单独显示“需认证/暂不可用”。
+    await Promise.allSettled([
+      api("/api/dashboard"),
+      api("/api/factors"),
+      api("/api/backtests"),
+      api("/api/instruments"),
+      api("/api/system/requirements"),
+      api("/api/paper/account"),
+      api("/api/data/status"),
+      api("/api/data/indices"),
+      api("/api/live/guard"),
+      api("/api/live/market-clock"),
+      api("/api/live/readiness"),
+      api("/api/strategies"),
+      api("/api/strategies/runs"),
+    ])
+  ).map((r, i) => (r.status === "fulfilled" ? r.value : DASHBOARD_FALLBACKS[i]));
   state.dashboard = dashboard;
   state.factors = factors.items;
   state.backtests = backtests.items;
@@ -94,9 +148,31 @@ async function loadCoreData() {
   state.paperAccount = paperAccount;
   state.dataStatus = dataStatus;
   state.indices = indices.items;
+  state.liveGuard = liveGuard;
+  state.marketClock = marketClock;
+  state.readiness = readiness;
+  state.strategies = strategies.items;
+  state.strategyRuns = strategyRuns.items;
   document.querySelector("#snapshot-label").textContent =
     dashboard.snapshot_id || "暂无数据快照";
 }
+
+// 首屏各接口失败时的安全回退（与 Promise.allSettled 顺序一一对应），避免单点 401 拖垮整页。
+const DASHBOARD_FALLBACKS = [
+  {}, // dashboard
+  { items: [] }, // factors
+  { items: [] }, // backtests
+  { items: [] }, // instruments
+  {}, // requirements
+  { positions: [], orders: [], cash: null, equity: null, requires_auth: true }, // paper/account
+  {}, // data/status
+  { items: [] }, // data/indices
+  { kill_switch: { active: false }, requires_auth: true }, // live/guard
+  {}, // market-clock
+  {}, // readiness
+  { items: [] }, // strategies
+  { items: [] }, // strategies/runs
+];
 
 function metric(label, value, note = "", tone = "") {
   return `
@@ -549,13 +625,14 @@ async function evaluateFactor(button) {
   try {
     const forwardDays = Number(document.querySelector("#factor-forward-days").value);
     const neutralize = document.querySelector("#factor-neutralize").value === "true";
-    const result = await api(`/api/factors/${button.dataset.factor}/evaluate`, {
+    const task = await api(`/api/factors/${button.dataset.factor}/evaluate`, {
       method: "POST",
       body: JSON.stringify({
         forward_days: forwardDays,
         neutralize,
       }),
     });
+    const result = await waitForTask(task.task_id, "因子评估中");
     showToast(`评估完成，IC ${number(result.metrics.ic_mean, 4)}`);
     await loadCoreData();
     renderFactors();
@@ -660,10 +737,12 @@ async function runBacktest(event) {
   button.disabled = true;
   button.textContent = "正在回测";
   try {
-    const result = await api("/api/backtests", {
+    const task = await api("/api/backtests", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    const completed = await waitForTask(task.task_id, "策略回测中");
+    const result = await api(`/api/backtests/${completed.run_id}`);
     state.activeBacktest = result;
     document.querySelector("#backtest-result").innerHTML = backtestResultMarkup(result);
     drawLineChart(document.querySelector("#backtest-chart"), result.equity_curve, "equity", "benchmark");
@@ -789,9 +868,9 @@ function renderPaper() {
   workspace.innerHTML = `
     <div class="metric-grid">
       ${metric("账户净值", `¥${number(account.equity)}`, account.name)}
-      ${metric("可用现金", `¥${number(account.cash)}`, "即时成交模拟")}
+      ${metric("可用现金", `¥${number(account.available_cash)}`, `冻结 ¥${number(account.reserved_cash)}`)}
       ${metric("持仓市值", `¥${number(account.market_value)}`, `${account.positions.length} 个持仓`)}
-      ${metric("累计收益", percent(account.total_return), "初始资金 ¥1,000,000", account.total_return >= 0 ? "positive" : "negative")}
+      ${metric("当日盈亏", `¥${number(account.daily_pnl)}`, `限额 ¥${number(account.daily_loss_limit)}`, account.daily_pnl >= 0 ? "positive" : "negative")}
     </div>
     <div class="workspace-grid">
       <section class="panel">
@@ -830,6 +909,9 @@ function renderPaper() {
       ${paperOrdersTable(account.orders)}
     </section>`;
   document.querySelector("#paper-order-form").addEventListener("submit", submitPaperOrder);
+  document.querySelectorAll("[data-cancel-order]").forEach((button) => {
+    button.addEventListener("click", () => cancelPaperOrder(button.dataset.cancelOrder));
+  });
   document.querySelector("#paper-order-type").addEventListener("change", (event) => {
     const limitInput = document.querySelector("#paper-limit-price");
     limitInput.disabled = event.currentTarget.value !== "limit";
@@ -841,10 +923,10 @@ function renderPaper() {
 function paperPositionsTable(items) {
   if (!items.length) return '<div class="empty-state">当前没有模拟持仓</div>';
   return `<div class="table-shell"><table>
-    <thead><tr><th>标的</th><th>数量</th><th>平均成本</th><th>最新价</th><th>市值</th><th>浮动盈亏</th></tr></thead>
+    <thead><tr><th>标的</th><th>数量</th><th>可卖</th><th>平均成本</th><th>最新价</th><th>市值</th><th>浮动盈亏</th></tr></thead>
     <tbody>${items.map((item) => `<tr>
       <td><strong>${escapeHtml(item.name)}</strong><div class="subtle mono">${escapeHtml(item.symbol)}</div></td>
-      <td>${item.quantity}</td><td>${number(item.average_cost, 4)}</td><td>${number(item.last_price, 4)}</td>
+      <td>${item.quantity}</td><td>${item.sellable_quantity}</td><td>${number(item.average_cost, 4)}</td><td>${number(item.last_price, 4)}</td>
       <td>¥${number(item.market_value)}</td><td class="${item.unrealized_pnl >= 0 ? "positive" : "negative"}">¥${number(item.unrealized_pnl)}</td>
     </tr>`).join("")}</tbody>
   </table></div>`;
@@ -853,14 +935,345 @@ function paperPositionsTable(items) {
 function paperOrdersTable(items) {
   if (!items.length) return '<div class="empty-state">暂无模拟委托</div>';
   return `<div class="table-shell"><table>
-    <thead><tr><th>委托ID</th><th>标的</th><th>方向</th><th>数量</th><th>状态</th><th>时间</th></tr></thead>
+    <thead><tr><th>委托ID</th><th>标的</th><th>方向</th><th>数量</th><th>状态</th><th>时间</th><th>操作</th></tr></thead>
     <tbody>${items.map((item) => `<tr>
       <td class="mono">${escapeHtml(item.client_order_id)}</td><td>${escapeHtml(item.symbol)}</td>
       <td>${item.side === "buy" ? "买入" : "卖出"}</td><td>${item.quantity}</td>
       <td><span class="badge ${item.status === "REJECTED" ? "danger" : ""}">${escapeHtml(item.status)}</span></td>
       <td>${escapeHtml(item.created_at.slice(0, 16).replace("T", " "))}</td>
+      <td>${["OPEN", "PARTIALLY_FILLED", "UNKNOWN"].includes(item.status) ? `<button class="button secondary" data-cancel-order="${escapeHtml(item.order_id)}">撤单</button>` : "—"}</td>
     </tr>`).join("")}</tbody>
   </table></div>`;
+}
+
+async function cancelPaperOrder(orderId) {
+  try {
+    const result = await api(`/api/paper/orders/${encodeURIComponent(orderId)}/cancel`, {
+      method: "POST",
+    });
+    state.paperAccount = result.account;
+    renderPaper();
+    showToast(`订单状态：${result.order.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function renderStrategy() {
+  const guard = state.liveGuard;
+  const clock = state.marketClock;
+  const keyConfigured = Boolean(window.localStorage.getItem("quantdevAdminKey"));
+  const readKeyConfigured = Boolean(window.localStorage.getItem("quantdevReadKey"));
+  const operator = window.localStorage.getItem("quantdevOperator") || "local-admin";
+  workspace.innerHTML = `
+    <div class="metric-grid">
+      ${metric("交易时钟", clock.can_trade ? "可交易" : "关闭", clock.session, clock.can_trade ? "positive" : "negative")}
+      ${metric("Broker 模式", guard.broker_mode, guard.live_trading_enabled ? "实盘总开关开启" : "实盘总开关关闭")}
+      ${metric("Kill Switch", guard.kill_switch.active ? "ACTIVE" : "OFF", guard.kill_switch.reason || "运行正常", guard.kill_switch.active ? "negative" : "positive")}
+      ${metric("当前阶段", state.readiness.current_stage, state.readiness.all_ready ? "全部就绪" : "仍有前置检查")}
+    </div>
+    <div class="workspace-grid">
+      <section class="panel">
+        <div class="panel-header"><div><h2>策略配置</h2><p>因子信号生成目标仓位与幂等订单意图</p></div></div>
+        <form id="strategy-form">
+          <div class="form-grid">
+            <div class="field span-2"><label for="strategy-name">名称</label><input id="strategy-name" value="多因子模拟实盘" required /></div>
+            <div class="field span-2"><label for="strategy-factor">因子</label><select id="strategy-factor">${factorOptions()}</select></div>
+            <div class="field"><label for="strategy-topn">持仓数</label><input id="strategy-topn" type="number" value="5" min="1" max="20" /></div>
+            <div class="field"><label for="strategy-cycle">调仓周期</label><input id="strategy-cycle" type="number" value="5" min="1" max="60" /></div>
+            <div class="field"><label for="strategy-notional">单票目标金额</label><input id="strategy-notional" type="number" value="5000" min="100" step="100" /></div>
+            <div class="field"><label for="strategy-enabled">创建后状态</label><select id="strategy-enabled"><option value="false">停用</option><option value="true">启用</option></select></div>
+          </div>
+          <div class="form-actions"><button class="button" type="submit">创建策略</button></div>
+        </form>
+      </section>
+      <aside class="panel">
+        <div class="panel-header"><div><h2>操作认证</h2><p>只读、管理、操作员身份分离</p></div></div>
+        <div class="field"><label for="read-key">只读密钥</label><input id="read-key" type="password" value="" placeholder="${readKeyConfigured ? "已保存在本机浏览器" : "未配置"}" /></div>
+        <div class="field"><label for="admin-key">管理员/操作员密钥</label><input id="admin-key" type="password" value="" placeholder="${keyConfigured ? "已保存在本机浏览器" : "未配置"}" /></div>
+        <div class="field"><label for="operator-name">操作员名</label><input id="operator-name" value="${escapeHtml(operator)}" /></div>
+        <div class="form-actions">
+          <button class="button secondary" id="save-admin-key" type="button">保存认证</button>
+          <button class="button ${guard.kill_switch.active ? "" : "danger"}" id="toggle-kill" type="button">${guard.kill_switch.active ? "解除熔断" : "立即熔断"}</button>
+        </div>
+      </aside>
+    </div>
+    <section class="panel">
+      <div class="panel-header"><div><h2>已配置策略</h2><p>自动运行前先保持停用并手动验证</p></div></div>
+      ${strategyTable(state.strategies)}
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>最近运行</h2><p>信号日期、运行状态与失败原因</p></div></div>
+      ${strategyRunsTable(state.strategyRuns)}
+    </section>
+    <section class="panel" id="strategy-intent-panel">
+      <div class="panel-header"><div><h2>订单意图</h2><p>选择一次运行查看审批与执行状态</p></div></div>
+      ${state.activeStrategyRun ? strategyIntentTable(state.activeStrategyRun) : '<div class="empty-state">尚未选择策略运行</div>'}
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>实盘就绪度</h2><p>按阶段逐项放行</p></div></div>
+      <div class="status-list">${state.readiness.stages.map((stage) => `
+        <div class="status-row"><span>${escapeHtml(stage.title)}</span><span class="badge ${stage.ready ? "" : "danger"}">${stage.ready ? "READY" : "BLOCKED"}</span></div>
+      `).join("")}</div>
+    </section>`;
+  document.querySelector("#strategy-form").addEventListener("submit", createStrategy);
+  document.querySelector("#save-admin-key").addEventListener("click", saveAdminKey);
+  document.querySelector("#toggle-kill").addEventListener("click", toggleKillSwitch);
+  document.querySelectorAll("[data-run-strategy]").forEach((button) => {
+    button.addEventListener("click", () => runStrategy(button.dataset.runStrategy));
+  });
+  document.querySelectorAll("[data-enable-strategy]").forEach((button) => {
+    button.addEventListener("click", () => setStrategyEnabled(
+      button.dataset.enableStrategy,
+      button.dataset.enabled !== "true",
+    ));
+  });
+  bindStrategyRunActions();
+}
+
+function strategyTable(items) {
+  if (!items.length) return '<div class="empty-state">暂无策略配置</div>';
+  return `<div class="table-shell"><table>
+    <thead><tr><th>名称</th><th>因子</th><th>持仓数</th><th>周期</th><th>单票金额</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>${items.map((item) => `<tr>
+      <td><strong>${escapeHtml(item.name)}</strong><div class="subtle mono">${escapeHtml(item.strategy_id)}</div></td>
+      <td>${escapeHtml(item.factor_id)}</td><td>${item.top_n}</td><td>${item.rebalance_days} 日</td><td>¥${number(item.max_order_notional)}</td>
+      <td><span class="badge ${item.enabled ? "" : "danger"}">${item.enabled ? "ENABLED" : "DISABLED"}</span></td>
+      <td><button class="button secondary" data-run-strategy="${escapeHtml(item.strategy_id)}">运行</button> <button class="button secondary" data-enable-strategy="${escapeHtml(item.strategy_id)}" data-enabled="${item.enabled}">${item.enabled ? "停用" : "启用"}</button></td>
+    </tr>`).join("")}</tbody>
+  </table></div>`;
+}
+
+function strategyRunsTable(items) {
+  if (!items.length) return '<div class="empty-state">暂无策略运行记录</div>';
+  return `<div class="table-shell"><table>
+    <thead><tr><th>运行ID</th><th>策略</th><th>交易日</th><th>信号日</th><th>状态</th><th>错误</th><th>操作</th></tr></thead>
+    <tbody>${items.map((item) => `<tr>
+      <td class="mono">${escapeHtml(item.run_id)}</td><td class="mono">${escapeHtml(item.strategy_id)}</td>
+      <td>${escapeHtml(item.trade_date)}</td><td>${escapeHtml(item.signal_date || "—")}</td>
+      <td><span class="badge ${["FAILED", "PARTIAL"].includes(item.status) ? "danger" : ""}">${escapeHtml(item.status)}</span></td>
+      <td>${escapeHtml(item.error_message || "—")}</td>
+      <td><button class="button secondary" data-view-run="${escapeHtml(item.run_id)}">查看意图</button></td>
+    </tr>`).join("")}</tbody>
+  </table></div>`;
+}
+
+function strategyIntentTable(run) {
+  if (!run.intents.length) return '<div class="empty-state">本次运行无需调仓</div>';
+  return `<div class="table-shell"><table>
+    <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>模式</th><th>审批</th><th>状态</th><th>订单号</th><th>操作</th></tr></thead>
+    <tbody>${run.intents.map((item) => `<tr>
+      <td class="mono">${escapeHtml(item.symbol)}</td>
+      <td>${item.side === "buy" ? "买入" : "卖出"}</td>
+      <td>${item.quantity}</td>
+      <td>${escapeHtml(item.execution_mode)}</td>
+      <td>${escapeHtml(item.approval_status)}</td>
+      <td><span class="badge ${["REJECTED", "BLOCKED", "ERROR"].includes(item.status) ? "danger" : ""}">${escapeHtml(item.status)}</span></td>
+      <td class="mono">${escapeHtml(item.broker_order_id || item.paper_order_id || "—")}</td>
+      <td>${intentActions(item)}</td>
+    </tr>`).join("")}</tbody>
+  </table></div>`;
+}
+
+function intentActions(item) {
+  if (item.execution_mode !== "live") return "—";
+  const actions = [];
+  if (["PENDING_APPROVAL", "BLOCKED"].includes(item.status)) {
+    actions.push(`<button class="button secondary" data-approve-intent="${escapeHtml(item.intent_id)}">审批</button>`);
+  }
+  if (item.approval_status === "APPROVED" && ["PENDING_APPROVAL", "APPROVED", "BLOCKED"].includes(item.status)) {
+    actions.push(`<button class="button" data-submit-intent="${escapeHtml(item.intent_id)}">提交</button>`);
+  }
+  if (!["FILLED", "CANCELLED", "REJECTED", "DRY_RUN"].includes(item.status)) {
+    actions.push(`<button class="button danger" data-reject-intent="${escapeHtml(item.intent_id)}">拒绝</button>`);
+  }
+  if (item.live_order_id && ["OPEN", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN"].includes(item.status)) {
+    actions.push(`<button class="button secondary" data-cancel-live="${escapeHtml(item.live_order_id)}">撤单</button>`);
+  }
+  return actions.join(" ") || "—";
+}
+
+function bindStrategyRunActions() {
+  document.querySelectorAll("[data-view-run]").forEach((button) => {
+    button.addEventListener("click", () => loadStrategyRun(button.dataset.viewRun));
+  });
+  document.querySelectorAll("[data-approve-intent]").forEach((button) => {
+    button.addEventListener("click", () => approveIntent(button.dataset.approveIntent));
+  });
+  document.querySelectorAll("[data-submit-intent]").forEach((button) => {
+    button.addEventListener("click", () => submitIntent(button.dataset.submitIntent));
+  });
+  document.querySelectorAll("[data-reject-intent]").forEach((button) => {
+    button.addEventListener("click", () => rejectIntent(button.dataset.rejectIntent));
+  });
+  document.querySelectorAll("[data-cancel-live]").forEach((button) => {
+    button.addEventListener("click", () => cancelLiveOrder(button.dataset.cancelLive));
+  });
+}
+
+async function loadStrategyRun(runId) {
+  try {
+    state.activeStrategyRun = await api(`/api/strategies/runs/${encodeURIComponent(runId)}`);
+    renderStrategy();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function refreshActiveStrategyRun() {
+  if (!state.activeStrategyRun) return;
+  state.activeStrategyRun = await api(`/api/strategies/runs/${encodeURIComponent(state.activeStrategyRun.run_id)}`);
+}
+
+async function approveIntent(intentId) {
+  try {
+    await api(`/api/strategies/intents/${encodeURIComponent(intentId)}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ reason: "前端人工核对通过" }),
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast("订单意图已审批，请在有效期内提交");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function submitIntent(intentId) {
+  try {
+    const result = await api(`/api/strategies/intents/${encodeURIComponent(intentId)}/submit`, {
+      method: "POST",
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast(`券商订单状态：${result.order.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function rejectIntent(intentId) {
+  if (!window.confirm("确认拒绝该订单意图？")) return;
+  try {
+    await api(`/api/strategies/intents/${encodeURIComponent(intentId)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ reason: "前端人工拒绝" }),
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast("订单意图已拒绝");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function cancelLiveOrder(orderId) {
+  try {
+    const result = await api(`/api/live/orders/${encodeURIComponent(orderId)}/cancel`, {
+      method: "POST",
+    });
+    await Promise.all([refreshStrategyData(), refreshActiveStrategyRun()]);
+    renderStrategy();
+    showToast(`撤单状态：${result.order.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function refreshStrategyData() {
+  const [guard, readiness, strategies, runs, clock] = await Promise.all([
+    api("/api/live/guard"),
+    api("/api/live/readiness"),
+    api("/api/strategies"),
+    api("/api/strategies/runs"),
+    api("/api/live/market-clock"),
+  ]);
+  state.liveGuard = guard;
+  state.readiness = readiness;
+  state.strategies = strategies.items;
+  state.strategyRuns = runs.items;
+  state.marketClock = clock;
+}
+
+function saveAdminKey() {
+  const readValue = document.querySelector("#read-key").value.trim();
+  const adminValue = document.querySelector("#admin-key").value.trim();
+  const operator = document.querySelector("#operator-name").value.trim() || "local-admin";
+  if (readValue) window.localStorage.setItem("quantdevReadKey", readValue);
+  else window.localStorage.removeItem("quantdevReadKey");
+  if (adminValue) window.localStorage.setItem("quantdevAdminKey", adminValue);
+  else window.localStorage.removeItem("quantdevAdminKey");
+  window.localStorage.setItem("quantdevOperator", operator);
+  showToast("认证信息已保存在本机浏览器");
+  renderStrategy();
+}
+
+async function createStrategy(event) {
+  event.preventDefault();
+  try {
+    await api("/api/strategies", {
+      method: "POST",
+      body: JSON.stringify({
+        name: document.querySelector("#strategy-name").value,
+        factor_id: document.querySelector("#strategy-factor").value,
+        top_n: Number(document.querySelector("#strategy-topn").value),
+        rebalance_days: Number(document.querySelector("#strategy-cycle").value),
+        max_order_notional: Number(document.querySelector("#strategy-notional").value),
+        enabled: document.querySelector("#strategy-enabled").value === "true",
+      }),
+    });
+    await refreshStrategyData();
+    renderStrategy();
+    showToast("策略已创建");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function runStrategy(strategyId) {
+  try {
+    const result = await api("/api/strategies/run", {
+      method: "POST",
+      body: JSON.stringify({ strategy_id: strategyId, force: false }),
+    });
+    await loadCoreData();
+    renderStrategy();
+    showToast(`策略运行状态：${result.status}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function setStrategyEnabled(strategyId, enabled) {
+  try {
+    await api(`/api/strategies/${encodeURIComponent(strategyId)}/enabled`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    await refreshStrategyData();
+    renderStrategy();
+    showToast(enabled ? "策略已启用" : "策略已停用");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function toggleKillSwitch() {
+  const active = !state.liveGuard.kill_switch.active;
+  try {
+    await api("/api/live/kill-switch", {
+      method: "POST",
+      body: JSON.stringify({
+        active,
+        reason: active ? "前端手动熔断" : "前端人工确认后解除",
+      }),
+    });
+    await refreshStrategyData();
+    renderStrategy();
+    showToast(active ? "Kill Switch 已激活" : "Kill Switch 已解除");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
 }
 
 async function submitPaperOrder(event) {
@@ -927,17 +1340,317 @@ async function runAgent(event) {
   }
 }
 
+const EXPLORER_TABS = [
+  ["prices", "个股行情"],
+  ["financials", "财务指标"],
+  ["factor", "因子打分榜"],
+  ["screener", "市场筛选"],
+];
+
+function fmtCell(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "number") return number(value);
+  return String(value);
+}
+
+function renderExplorer() {
+  const ex = state.explorer;
+  const tabBar = EXPLORER_TABS.map(
+    ([key, label]) =>
+      `<button class="button ${ex.tab === key ? "" : "secondary"}" data-ex-tab="${key}">${label}</button>`,
+  ).join(" ");
+  let body = "";
+  if (ex.tab === "prices") body = explorerPricesTab(ex);
+  else if (ex.tab === "financials") body = explorerFinancialsTab(ex);
+  else if (ex.tab === "factor") body = explorerFactorTab(ex);
+  else body = explorerScreenerTab(ex);
+  workspace.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tabBar}</div>
+    ${body}`;
+  wireExplorer(ex);
+}
+
+function explorerPricesTab(ex) {
+  const p = ex.prices;
+  let detail = `<div class="empty-state compact">输入股票代码后点击查询</div>`;
+  if (p && p.items && p.items.length) {
+    const rows = p.items
+      .slice()
+      .reverse()
+      .map(
+        (r) => `<tr>
+          <td class="mono">${escapeHtml(r.trade_date)}</td>
+          <td>${number(r.open)}</td><td>${number(r.high)}</td>
+          <td>${number(r.low)}</td><td><strong>${number(r.close)}</strong></td>
+          <td>${Number(r.volume || 0).toLocaleString("zh-CN")}</td>
+        </tr>`,
+      )
+      .join("");
+    detail = `
+      <div class="panel-header" style="margin-top:8px"><div><h2 style="font-size:16px">${escapeHtml(p.symbol)} 价格走势（前复权）</h2></div></div>
+      <div class="chart-wrap"><canvas id="explorer-price-chart"></canvas></div>
+      <div class="table-shell"><table>
+        <thead><tr><th>交易日</th><th>开</th><th>高</th><th>低</th><th>收</th><th>成交量</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+  }
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>个股行情</h2><p>输入股票代码查看历史价格与走势</p></div></div>
+    <div class="form-grid">
+      <div class="field span-2"><label for="ex-symbol">股票代码</label>
+        <input id="ex-symbol" value="${escapeHtml(ex.symbol)}" placeholder="如 600519.SH / 000001.SZ" /></div>
+      <div class="form-actions" style="align-self:end"><button class="button" id="ex-price-query">查询</button></div>
+    </div>
+    ${detail}
+  </section>`;
+}
+
+function explorerFinancialsTab(ex) {
+  const f = ex.financials;
+  let table = `<div class="empty-state compact">输入股票代码后点击查询</div>`;
+  if (f) {
+    if (!f.items || !f.items.length) {
+      table = `<div class="empty-state compact">该标的暂无财务数据</div>`;
+    } else {
+      const cols = Object.keys(f.items[0]);
+      table = `<div class="table-shell"><table>
+        <thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>
+        <tbody>${f.items
+          .map(
+            (row) =>
+              `<tr>${cols.map((c) => `<td class="mono">${escapeHtml(fmtCell(row[c]))}</td>`).join("")}</tr>`,
+          )
+          .join("")}</tbody></table></div>`;
+    }
+  }
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>财务指标</h2><p>输入股票代码查看财务指标历史（左右可滚动）</p></div></div>
+    <div class="form-grid">
+      <div class="field span-2"><label for="ex-fin-symbol">股票代码</label>
+        <input id="ex-fin-symbol" value="${escapeHtml(ex.symbol)}" placeholder="如 600519.SH" /></div>
+      <div class="form-actions" style="align-self:end"><button class="button" id="ex-fin-query">查询</button></div>
+    </div>
+    ${table}
+  </section>`;
+}
+
+function explorerFactorTab(ex) {
+  const options = state.factors
+    .map(
+      (item) =>
+        `<option value="${escapeHtml(item.factor_id)}" ${ex.factorId === item.factor_id ? "selected" : ""}>${escapeHtml(item.name || item.factor_id)}</option>`,
+    )
+    .join("");
+  const s = ex.factorScores;
+  const board = (items, title) => `<section class="panel">
+    <div class="panel-header"><div><h2 style="font-size:16px">${title}</h2></div></div>
+    <div class="table-shell"><table>
+      <thead><tr><th>#</th><th>代码</th><th>名称</th><th>行业</th><th>因子值</th></tr></thead>
+      <tbody>${items
+        .map(
+          (it, i) =>
+            `<tr><td>${i + 1}</td><td class="mono">${escapeHtml(it.symbol)}</td><td>${escapeHtml(it.name)}</td><td>${escapeHtml(it.industry)}</td><td><strong>${number(it.score, 4)}</strong></td></tr>`,
+        )
+        .join("")}</tbody></table></div></section>`;
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>因子打分榜</h2><p>读取最新缓存；缓存缺失时使用管理员权限创建后台刷新任务</p></div></div>
+    <div class="form-grid">
+      <div class="field span-2"><label for="ex-factor">因子</label><select id="ex-factor">${options}</select></div>
+      <div class="form-actions" style="align-self:end"><button class="button" id="ex-factor-query">查询</button></div>
+    </div>
+  </section>
+  ${
+    s
+      ? `<div class="subtle" style="margin:4px 0 12px">信号日 ${escapeHtml(s.signal_date || "")} · 全市场 ${s.count} 只</div>
+         ${board(s.top, "📈 得分最高 Top")} ${board(s.bottom, "📉 得分最低 Bottom")}`
+      : `<div class="empty-state compact">选择因子后点击查询缓存</div>`
+  }`;
+}
+
+function explorerScreenerTab(ex) {
+  const industries = Array.from(
+    new Set(state.instruments.map((i) => i.industry).filter(Boolean)),
+  ).sort();
+  let list = state.instruments.slice();
+  if (ex.screenIndustry) list = list.filter((i) => i.industry === ex.screenIndustry);
+  if (ex.screenKeyword.trim()) {
+    const kw = ex.screenKeyword.trim();
+    list = list.filter((i) => `${i.symbol}${i.name || ""}`.includes(kw));
+  }
+  if (ex.screenSort === "name")
+    list.sort((a, b) => (a.name || "").localeCompare(b.name || "", "zh"));
+  else if (ex.screenSort === "industry")
+    list.sort((a, b) => (a.industry || "").localeCompare(b.industry || "", "zh"));
+  else list.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  const shown = list.slice(0, 200);
+  const opts =
+    `<option value="">全部行业</option>` +
+    industries
+      .map(
+        (i) =>
+          `<option value="${escapeHtml(i)}" ${ex.screenIndustry === i ? "selected" : ""}>${escapeHtml(i)}</option>`,
+      )
+      .join("");
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>市场筛选</h2><p>共 ${state.instruments.length} 只，按筛选后展示前 ${shown.length}（关键词输入后按回车）</p></div></div>
+    <div class="form-grid">
+      <div class="field"><label for="ex-screen-industry">行业</label><select id="ex-screen-industry">${opts}</select></div>
+      <div class="field"><label for="ex-screen-kw">代码/名称关键词</label><input id="ex-screen-kw" value="${escapeHtml(ex.screenKeyword)}" placeholder="如 银行 / 600" /></div>
+      <div class="field"><label for="ex-screen-sort">排序</label><select id="ex-screen-sort">
+        <option value="symbol" ${ex.screenSort === "symbol" ? "selected" : ""}>按代码</option>
+        <option value="name" ${ex.screenSort === "name" ? "selected" : ""}>按名称</option>
+        <option value="industry" ${ex.screenSort === "industry" ? "selected" : ""}>按行业</option>
+      </select></div>
+    </div>
+    <div class="table-shell"><table>
+      <thead><tr><th>代码</th><th>名称</th><th>交易所</th><th>行业</th><th></th></tr></thead>
+      <tbody>${shown
+        .map(
+          (i) => `<tr>
+          <td class="mono">${escapeHtml(i.symbol)}</td><td>${escapeHtml(i.name)}</td>
+          <td>${escapeHtml(i.exchange)}</td><td>${escapeHtml(i.industry)}</td>
+          <td><button class="button secondary" data-ex-view-symbol="${escapeHtml(i.symbol)}">看行情</button></td>
+        </tr>`,
+        )
+        .join("")}</tbody></table></div>
+  </section>`;
+}
+
+function wireExplorer(ex) {
+  document.querySelectorAll("[data-ex-tab]").forEach((b) =>
+    b.addEventListener("click", () => {
+      ex.tab = b.dataset.exTab;
+      renderExplorer();
+    }),
+  );
+  const bind = (id, event, fn) => {
+    const el = document.querySelector(id);
+    if (el) el.addEventListener(event, fn);
+  };
+  const onEnter = (id, fn) =>
+    bind(id, "keydown", (e) => {
+      if (e.key === "Enter") fn();
+    });
+  bind("#ex-price-query", "click", explorerQueryPrices);
+  onEnter("#ex-symbol", explorerQueryPrices);
+  bind("#ex-fin-query", "click", explorerQueryFinancials);
+  onEnter("#ex-fin-symbol", explorerQueryFinancials);
+  bind("#ex-factor-query", "click", explorerQueryFactor);
+  bind("#ex-screen-industry", "change", (e) => {
+    ex.screenIndustry = e.target.value;
+    renderExplorer();
+  });
+  bind("#ex-screen-sort", "change", (e) => {
+    ex.screenSort = e.target.value;
+    renderExplorer();
+  });
+  bind("#ex-screen-kw", "input", (e) => {
+    ex.screenKeyword = e.target.value;
+  });
+  onEnter("#ex-screen-kw", renderExplorer);
+  document.querySelectorAll("[data-ex-view-symbol]").forEach((b) =>
+    b.addEventListener("click", () => {
+      ex.symbol = b.dataset.exViewSymbol;
+      ex.tab = "prices";
+      explorerQueryPrices();
+    }),
+  );
+  if (ex.tab === "prices" && ex.prices && ex.prices.items && ex.prices.items.length) {
+    const canvas = document.querySelector("#explorer-price-chart");
+    if (canvas)
+      drawLineChart(
+        canvas,
+        ex.prices.items.map((r) => ({ date: r.trade_date, close: Number(r.close) })),
+        "close",
+      );
+  }
+}
+
+async function explorerQueryPrices() {
+  const ex = state.explorer;
+  const input = document.querySelector("#ex-symbol");
+  const symbol = (input ? input.value : ex.symbol).trim();
+  if (!symbol) return;
+  ex.symbol = symbol;
+  try {
+    ex.prices = await api(`/api/market/prices?symbol=${encodeURIComponent(symbol)}&limit=120`);
+    ex.tab = "prices";
+    renderExplorer();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function explorerQueryFinancials() {
+  const ex = state.explorer;
+  const input = document.querySelector("#ex-fin-symbol");
+  const symbol = (input ? input.value : ex.symbol).trim();
+  if (!symbol) return;
+  ex.symbol = symbol;
+  try {
+    ex.financials = await api(
+      `/api/data/financials/${encodeURIComponent(symbol)}?limit=20`,
+    );
+    renderExplorer();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function explorerQueryFactor() {
+  const ex = state.explorer;
+  const select = document.querySelector("#ex-factor");
+  const factorId = select ? select.value : ex.factorId;
+  if (!factorId) {
+    showToast("请选择一个因子", "error");
+    return;
+  }
+  ex.factorId = factorId;
+  showToast("正在读取因子分数缓存");
+  try {
+    ex.factorScores = await api(
+      `/api/factors/${encodeURIComponent(factorId)}/scores?limit=30`,
+    );
+    renderExplorer();
+  } catch (error) {
+    const adminKey = window.localStorage.getItem("quantdevAdminKey") || "";
+    if (!adminKey) {
+      showToast(error.message, "error");
+      return;
+    }
+    try {
+      const task = await api(
+        `/api/factors/${encodeURIComponent(factorId)}/scores/refresh`,
+        { method: "POST" },
+      );
+      await waitForTask(task.task_id, "因子分数缓存刷新中");
+      ex.factorScores = await api(
+        `/api/factors/${encodeURIComponent(factorId)}/scores?limit=30`,
+      );
+      renderExplorer();
+      showToast("因子分数缓存已刷新");
+    } catch (refreshError) {
+      showToast(refreshError.message, "error");
+    }
+  }
+}
+
 function render() {
   const [eyebrow, title] = viewMeta[state.view];
   document.querySelector("#page-eyebrow").textContent = eyebrow;
   document.querySelector("#page-title").textContent = title;
+  if (!state.dashboard) {
+    workspace.innerHTML = '<div class="empty-state">正在初始化研究环境...</div>';
+    return;
+  }
   const renderers = {
     overview: renderOverview,
     data: renderData,
+    explorer: renderExplorer,
     factors: renderFactors,
     backtest: renderBacktest,
     risk: renderRisk,
     paper: renderPaper,
+    strategy: renderStrategy,
     agent: renderAgent,
   };
   renderers[state.view]();

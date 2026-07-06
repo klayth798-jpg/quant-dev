@@ -1,7 +1,7 @@
 """P2 测试：数据库后端抽象层 + 全局领域事件总线。
 
 覆盖：
-  - 后端工厂：默认 sqlite；postgres 显式未实现报错；未知后端报错。
+  - 后端工厂：默认 sqlite；postgres 需要连接 URL；未知后端报错。
   - 事件总线：先持久化再分发；订阅者收到事件；订阅者异常不影响落库。
   - 端到端：下单 / 对账 / Kill Switch 会写入 domain_events，可经 /api/events 查询。
 """
@@ -21,14 +21,21 @@ def test_database_factory_defaults_to_sqlite():
     assert backend.backend == "sqlite"
 
 
-def test_database_factory_postgres_not_implemented(monkeypatch):
+def test_database_factory_postgres(monkeypatch):
     import quantdev.db as db_module
 
     monkeypatch.setattr(
-        db_module, "settings", replace(db_module.settings, database_backend="postgres")
+        db_module,
+        "settings",
+        replace(
+            db_module.settings,
+            database_backend="postgres",
+            database_url="postgresql://quantdev:test@postgres/quantdev",
+        ),
     )
-    with pytest.raises(NotImplementedError):
-        db_module.create_database()
+    backend = db_module.create_database()
+    assert backend.backend == "postgresql"
+    assert backend.display_name == "postgresql"
 
 
 def test_database_factory_unknown_backend(monkeypatch):

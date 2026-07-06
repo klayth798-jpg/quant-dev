@@ -6,8 +6,10 @@ Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 Requires-Dist: fastapi==0.115.12
 Requires-Dist: pandas==2.3.0
+Requires-Dist: psycopg[binary]==3.2.9
 Requires-Dist: pydantic==2.11.5
 Requires-Dist: python-dotenv==1.1.0
+Requires-Dist: redis==6.2.0
 Requires-Dist: tushare==1.4.24
 Requires-Dist: uvicorn[standard]==0.34.3
 Provides-Extra: dev
@@ -21,12 +23,17 @@ Requires-Dist: ruff==0.11.13; extra == "dev"
 
 当前版本提供完整的本地纵向链路：
 
-- 可复现的 A 股研究数据快照
+- A 股研究数据集、运行参数和结果留痕
 - Tushare Pro 真实 A 股日线、复权因子、每日估值、财务指标和指数历史成分
 - 因子注册、版本和 RankIC/ICIR 评估
 - 包含佣金、印花税、滑点和 100 股整数手的回测
 - 组合预交易风控
 - 幂等模拟委托、成交、现金和持仓账本
+- 实时行情时效闸门、T+1、冻结、撤单和订单恢复
+- 持久化策略运行、目标仓位和订单意图
+- 统一 Paper/Live 执行路由、持久化人工审批和实盘订单状态机
+- Kill Switch、每日亏损限制、Mock Broker 压测、同步和四方对账
+- 数据集 Manifest、回测数据版本绑定和盘中行情历史留痕
 - 只读研究 Agent 权限边界
 - FastAPI 和零构建 Web 工作台
 
@@ -47,21 +54,48 @@ API 文档位于 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)。
 
 ## 真实 A 股数据
 
-复制环境变量模板并填写自己的 Tushare Token：
+项目支持官方 Tushare SDK 和兼容的 Tinyshare SDK。复制环境变量模板并填写授权信息：
 
 ```bash
 cp .env.example .env
 ```
 
 ```dotenv
-TUSHARE_TOKEN=你的_token
-TUSHARE_FINANCIAL_VIP=false
+QUANTDEV_DATA_MODE=real
+MARKET_DATA_SDK=tinyshare
+TINYSHARE_TOKEN=你的授权码
+TUSHARE_FINANCIAL_VIP=true
+TUSHARE_CALL_INTERVAL_SECONDS=0.15
 TUSHARE_DEFAULT_INDICES=000300.SH,000905.SH,000852.SH
 ```
 
-重启服务后进入“数据中心”，选择日期和数据模块并创建同步任务。同步在后台执行，页面会
+Tinyshare 首次使用需要单独安装：
+
+```bash
+make install-tinyshare
+```
+
+使用官方 Tushare 时改为：
+
+```dotenv
+MARKET_DATA_SDK=tushare
+TUSHARE_TOKEN=你的_token
+TUSHARE_FINANCIAL_VIP=false
+```
+
+`QUANTDEV_DATA_MODE=real` 会关闭启动时的 demo 数据注入。重启服务后进入“数据中心”，
+选择日期和数据模块并创建同步任务。同步在后台执行，页面会
 展示任务状态、写入行数与失败原因。已完成的交易日和指数月份会自动跳过，因此日常更新
 可以继续使用同一个日期区间。
+
+需要清空现有样本数据并切换到真实库时：
+
+```bash
+make reset-real
+.venv/bin/python -m quantdev.cli sync-market \
+  --start-date 2025-01-02 \
+  --end-date 2026-06-08
+```
 
 数据落库时执行以下单位标准化：
 
@@ -98,6 +132,9 @@ backend/quantdev/
     backtest.py          成本后事件回测
     risk.py              预交易风控
     execution.py         模拟 OMS 与账本
+    pretrade.py          实盘报单前硬风控
+    execution_router.py  Paper/Live 执行路由
+    live_execution.py    实盘审批、报单、撤单和同步
     agent.py             只读研究 Agent
   integrations/
     market_data.py       行情数据适配器
@@ -110,14 +147,25 @@ infra/                   容器部署
 
 ## 外部 API
 
-本地样例链路不要求任何 API。真实 A 股数据需要 `TUSHARE_TOKEN`；复用原
+本地样例链路不要求任何 API。真实 A 股数据需要 `TUSHARE_TOKEN` 或
+`TINYSHARE_TOKEN`；复用原
 `deep-research-quant` 服务时需要它的只读服务地址和鉴权方式。
 
 详细信息见 [docs/API_AND_PERMISSIONS.md](docs/API_AND_PERMISSIONS.md)。
+
+## 使用文档
+
+- [项目代码讲解](docs/PROJECT_CODE_GUIDE.md)
+- [前端操作手册](docs/FRONTEND_OPERATION_GUIDE.md)
+- [架构说明](docs/ARCHITECTURE.md)
+- [API 与权限清单](docs/API_AND_PERMISSIONS.md)
+- [模拟实盘与真实实盘操作手册](docs/LIVE_TRADING_RUNBOOK.md)
 
 ## 安全约束
 
 - 不允许把 `.env`、API Key、券商密钥提交到 Git。
 - Agent 仅依赖因子、回测和风险读取接口。
-- Broker 适配器默认使用 `DisabledLiveBroker`。
-- 实盘开放前必须增加身份认证、双人审批、Kill Switch 和每日对账。
+- `live` 模式未配置真实适配器时使用失败关闭边界，绝不会回退到 Mock Broker。
+- 管理写接口支持 `X-Admin-Key`；真实资金前仍应升级为正式登录、RBAC 和双人审批。
+- 实盘审批会保存操作人、理由、请求哈希和过期时间；订单参数变化后原审批自动失效。
+- `MockLiveBroker` 仅用于异常压测，不代表已经接入真实券商。

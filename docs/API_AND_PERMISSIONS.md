@@ -70,6 +70,65 @@ Token 或代理授权码请只写入项目根目录 `.env` 或部署密钥系统
 当前尚未接入分钟线、历史停复牌、历史 ST 标签和交易所官方每日涨跌停价格。回测中的
 ST 与涨跌停约束是基于最新名称和板块规则的近似模型。
 
+## 盘中行情接口
+
+模拟实盘订单默认要求盘中行情：
+
+- `GET /api/live/quotes`：查询当前缓存行情。
+- `POST /api/live/quotes`：写入最新价、买一、卖一、时间、来源和状态。
+
+系统会保存最新行情和历史接收记录，并拒绝未来时间、买价高于卖价、价差超过
+`QUANTDEV_QUOTE_MAX_SPREAD_BPS`、未知状态或不存在标的。估值只使用同一交易日且未过期
+的实时行情，过期后降级到最近日线，不把旧盘中价格冒充当前价格。
+
+业务读接口可配置只读密钥：
+
+```http
+X-Read-Key: <只读密钥>
+```
+
+管理写接口在配置 `QUANTDEV_ADMIN_API_KEY` 后要求：
+
+```http
+X-Admin-Key: <管理员密钥>
+```
+
+实盘审批和提交建议使用操作员密钥：
+
+```dotenv
+QUANTDEV_OPERATOR_KEYS=alice:<alice-key>,bob:<bob-key>
+```
+
+配置后系统按密钥反查操作员身份，不再信任客户端自报的 `X-Operator`。双人复核时，
+审批人和提交人必须使用不同操作员密钥。
+
+行情源必须由用户选定的实时数据服务提供。Tinyshare 5k 权益在本项目中主要用于日线、
+每日指标、财务和指数数据；是否包含稳定盘中行情能力应以代理服务合同为准，不能由日线
+权限推断。
+
+## 策略与 OMS API
+
+- `GET/POST /api/strategies`
+- `POST /api/strategies/{strategy_id}/enabled`
+- `POST /api/strategies/run`
+- `GET /api/strategies/runs`
+- `GET /api/strategies/runs/{run_id}`
+- `POST /api/strategies/intents/{intent_id}/approve`
+- `POST /api/strategies/intents/{intent_id}/reject`
+- `POST /api/strategies/intents/{intent_id}/submit`
+- `GET /api/paper/account`
+- `POST /api/paper/orders`
+- `POST /api/paper/orders/{order_id}/cancel`
+- `POST /api/paper/match`
+- `GET /api/live/orders`
+- `POST /api/live/orders/{order_id}/cancel`
+- `POST /api/live/sync`
+- `POST /api/live/reconcile`
+
+策略运行、行情写入、订单、撤单、Kill Switch、对账和数据同步属于写操作，应通过
+管理员或操作员认证并只暴露在本机或受控网络。生产部署建议同时配置只读密钥，避免
+研究数据和任务 payload 在公网裸读。
+
 ### deep-research-quant
 
 环境变量：
@@ -87,7 +146,7 @@ ST 与涨跌停约束是基于最新名称和板块规则的近似模型。
 
 本项目只会向它开放因子、回测和风险的只读数据，不开放订单、现金或持仓写权限。
 
-## 实盘前才需要
+## 实盘 Broker
 
 券商 API 需要支持：
 
@@ -99,6 +158,32 @@ ST 与涨跌停约束是基于最新名称和板块规则的近似模型。
 - IP 白名单及密钥轮换
 
 在模拟盘验收前，不需要申请或提供券商密钥。
+
+配置入口：
+
+```dotenv
+QUANTDEV_BROKER_MODE=live
+QUANTDEV_BROKER_ADAPTER=your_package.qmt:create_broker
+QUANTDEV_LIVE_TRADING_ENABLED=true
+QUANTDEV_REQUIRE_ORDER_APPROVAL=true
+```
+
+`QUANTDEV_BROKER_ADAPTER` 指向一个无参数工厂函数，返回 `BrokerAdapter` 实例。当前
+`MockLiveBroker` 会持久化模拟账户、持仓、订单和成交，用于拒单、超时、未知状态、
+部分成交和撤单失败测试。它不是实际券商适配器。`live` 模式不会回退到 Mock；真实
+适配器必须让 `health_check().mode == "live"`，否则报单和实盘就绪度都会失败关闭。
+
+真实 Broker 默认建议保持：
+
+```dotenv
+QUANTDEV_BROKER_DRY_RUN=true
+```
+
+dry-run 模式下，账户、持仓、委托和成交查询透传真实适配器，但报单/撤单不会发送到真实
+柜台，只产生本地 dry-run 回执。关闭 dry-run 前，就绪度不会放行真实下单阶段。
+
+实盘审批记录包含操作人、理由、请求哈希和有效期。券商正式生产账户仍应在网关或组织
+权限层增加登录、RBAC、IP 白名单和密钥轮换。
 
 ## 已发现的旧仓库安全事项
 

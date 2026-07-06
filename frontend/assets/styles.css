@@ -440,6 +440,15 @@ tbody tr:hover {
   background: var(--surface-soft);
 }
 
+.button.danger {
+  border-color: var(--red);
+  background: var(--red);
+}
+
+.button.danger:hover {
+  background: #972d36;
+}
+
 .button.small {
   min-height: 28px;
   padding: 5px 9px;

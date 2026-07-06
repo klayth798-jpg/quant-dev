@@ -1,43 +1,109 @@
 services:
-  app:
-    build:
-      context: .
-      dockerfile: infra/Dockerfile
-    env_file:
-      - .env
-    ports:
-      - "8000:8000"
-    environment:
-      QUANTDEV_ENV: production
-      QUANTDEV_DATABASE_PATH: /app/data/quantdev.db
-    volumes:
-      - quantdev-data:/app/data
-
   postgres:
     image: postgres:16-alpine
-    profiles: ["platform"]
     environment:
       POSTGRES_DB: quantdev
       POSTGRES_USER: quantdev
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdev-local}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantdev -d quantdev"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
-    profiles: ["platform"]
-
-  minio:
-    image: minio/minio:latest
-    profiles: ["platform"]
-    command: server /data --console-address ":9001"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:-quantdev-local}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     environment:
-      MINIO_ROOT_USER: quantdev
-      MINIO_ROOT_PASSWORD: change-me-now
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-quantdev-local}
     volumes:
-      - minio-data:/data
+      - redis-data:/data
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["python", "-m", "quantdev.cli", "migrate"]
+    environment: &app-environment
+      QUANTDEV_ENV: development
+      QUANTDEV_DATA_MODE: ${QUANTDEV_DATA_MODE:-demo}
+      QUANTDEV_DATABASE_BACKEND: postgresql
+      QUANTDEV_DATABASE_URL: postgresql://quantdev:${POSTGRES_PASSWORD:-quantdev-local}@postgres:5432/quantdev
+      QUANTDEV_TASK_BACKEND: redis
+      QUANTDEV_REDIS_URL: redis://:${REDIS_PASSWORD:-quantdev-local}@redis:6379/0
+      QUANTDEV_ADMIN_API_KEY: ${QUANTDEV_ADMIN_API_KEY:-quantdev-local-admin}
+      QUANTDEV_OPERATOR_KEYS: ${QUANTDEV_OPERATOR_KEYS:-}
+      QUANTDEV_BROKER_DRY_RUN: ${QUANTDEV_BROKER_DRY_RUN:-true}
+      MARKET_DATA_SDK: ${MARKET_DATA_SDK:-tushare}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      TINYSHARE_TOKEN: ${TINYSHARE_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    environment: *app-environment
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["python", "-m", "quantdev.cli", "worker"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  paper-runner:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    profiles: ["paper-live"]
+    command: ["python", "-m", "quantdev.cli", "paper-runner"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  live-runner:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    profiles: ["live"]
+    command: ["python", "-m", "quantdev.cli", "live-runner"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
 volumes:
-  quantdev-data:
   postgres-data:
-  minio-data:
+  redis-data:

@@ -1,0 +1,218 @@
+x-app-environment: &app-environment
+  QUANTDEV_ENV: production
+  QUANTDEV_DATA_MODE: ${QUANTDEV_DATA_MODE:-real}
+  QUANTDEV_LOG_LEVEL: ${QUANTDEV_LOG_LEVEL:-INFO}
+  QUANTDEV_DATABASE_BACKEND: postgresql
+  QUANTDEV_DATABASE_URL: postgresql://quantdev:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/quantdev
+  QUANTDEV_TASK_BACKEND: redis
+  QUANTDEV_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+  QUANTDEV_TASK_QUEUE_NAME: ${QUANTDEV_TASK_QUEUE_NAME:-quantdev:tasks}
+  QUANTDEV_TASK_MAX_ATTEMPTS: ${QUANTDEV_TASK_MAX_ATTEMPTS:-3}
+  QUANTDEV_TASK_VISIBILITY_TIMEOUT_SECONDS: ${QUANTDEV_TASK_VISIBILITY_TIMEOUT_SECONDS:-1800}
+  QUANTDEV_WORKER_POLL_SECONDS: ${QUANTDEV_WORKER_POLL_SECONDS:-5}
+  QUANTDEV_READ_API_KEY: ${QUANTDEV_READ_API_KEY:?set QUANTDEV_READ_API_KEY}
+  QUANTDEV_ADMIN_API_KEY: ${QUANTDEV_ADMIN_API_KEY:?set QUANTDEV_ADMIN_API_KEY}
+  QUANTDEV_OPERATOR_KEYS: ${QUANTDEV_OPERATOR_KEYS:-}
+  QUANTDEV_REQUIRE_DUAL_APPROVAL: ${QUANTDEV_REQUIRE_DUAL_APPROVAL:-true}
+  QUANTDEV_ALERT_WEBHOOK_URL: ${QUANTDEV_ALERT_WEBHOOK_URL:-}
+  QUANTDEV_RECONCILIATION_INTERVAL_SECONDS: ${QUANTDEV_RECONCILIATION_INTERVAL_SECONDS:-300}
+  QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS: ${QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS:-0}
+  MARKET_DATA_SDK: ${MARKET_DATA_SDK:-tushare}
+  TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+  TINYSHARE_TOKEN: ${TINYSHARE_TOKEN:-}
+  TUSHARE_FINANCIAL_VIP: ${TUSHARE_FINANCIAL_VIP:-false}
+  TUSHARE_CALL_INTERVAL_SECONDS: ${TUSHARE_CALL_INTERVAL_SECONDS:-0.35}
+  TUSHARE_DEFAULT_INDICES: ${TUSHARE_DEFAULT_INDICES:-000300.SH,000905.SH,000852.SH}
+  QUANTDEV_BROKER_MODE: ${QUANTDEV_BROKER_MODE:-disabled}
+  QUANTDEV_BROKER_ADAPTER: ${QUANTDEV_BROKER_ADAPTER:-}
+  QUANTDEV_BROKER_DRY_RUN: ${QUANTDEV_BROKER_DRY_RUN:-true}
+  QUANTDEV_LIVE_TRADING_ENABLED: ${QUANTDEV_LIVE_TRADING_ENABLED:-false}
+  QUANTDEV_REQUIRE_ORDER_APPROVAL: ${QUANTDEV_REQUIRE_ORDER_APPROVAL:-true}
+  QUANTDEV_MAX_LIVE_ORDER_NOTIONAL: ${QUANTDEV_MAX_LIVE_ORDER_NOTIONAL:-5000}
+  QUANTDEV_MAX_DAILY_LOSS: ${QUANTDEV_MAX_DAILY_LOSS:-1000}
+  QUANTDEV_PAPER_ENFORCE_SESSION: ${QUANTDEV_PAPER_ENFORCE_SESSION:-true}
+  QUANTDEV_PAPER_QUOTE_MODE: ${QUANTDEV_PAPER_QUOTE_MODE:-realtime}
+  QUANTDEV_QUOTE_MAX_AGE_SECONDS: ${QUANTDEV_QUOTE_MAX_AGE_SECONDS:-15}
+  QUANTDEV_CALENDAR_FAIL_CLOSED: ${QUANTDEV_CALENDAR_FAIL_CLOSED:-true}
+  QUANTDEV_AUTO_KILL_ON_RECON_BREAK: ${QUANTDEV_AUTO_KILL_ON_RECON_BREAK:-true}
+  QUANTDEV_RUNNER_POLL_SECONDS: ${QUANTDEV_RUNNER_POLL_SECONDS:-5}
+  QUANTDEV_RUNNER_LEASE_SECONDS: ${QUANTDEV_RUNNER_LEASE_SECONDS:-60}
+  QUANTDEV_APPROVAL_TTL_SECONDS: ${QUANTDEV_APPROVAL_TTL_SECONDS:-300}
+  QUANTDEV_RECONCILIATION_MAX_AGE_MINUTES: ${QUANTDEV_RECONCILIATION_MAX_AGE_MINUTES:-1440}
+  QUANTDEV_QUOTE_MAX_SPREAD_BPS: ${QUANTDEV_QUOTE_MAX_SPREAD_BPS:-100}
+  BROKER_ACCOUNT_ID: ${BROKER_ACCOUNT_ID:-}
+  BROKER_API_KEY: ${BROKER_API_KEY:-}
+  BROKER_API_SECRET: ${BROKER_API_SECRET:-}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: quantdev
+      POSTGRES_USER: quantdev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantdev -d quantdev"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - redis-data:/data
+    networks: [backend]
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["python", "-m", "quantdev.cli", "migrate"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [backend]
+
+  app:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    restart: unless-stopped
+    environment: *app-environment
+    expose: ["8000"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 7s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend, edge]
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["python", "-m", "quantdev.cli", "worker"]
+    restart: unless-stopped
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend]
+
+  paper-runner:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    profiles: ["paper-live"]
+    command: ["python", "-m", "quantdev.cli", "paper-runner"]
+    restart: unless-stopped
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend]
+
+  live-runner:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    profiles: ["live"]
+    command: ["python", "-m", "quantdev.cli", "live-runner"]
+    restart: unless-stopped
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      QUANTDEV_DOMAIN: ${QUANTDEV_DOMAIN:-localhost}
+      QUANTDEV_ALLOWED_IPS: ${QUANTDEV_ALLOWED_IPS:-127.0.0.1/32 ::1 private_ranges}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [edge]
+
+  postgres-backup:
+    image: postgres:16-alpine
+    profiles: ["ops"]
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: quantdev
+      PGUSER: quantdev
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    command: ["sh", "/opt/quantdev/postgres-backup.sh"]
+    volumes:
+      - ./infra/postgres-backup.sh:/opt/quantdev/postgres-backup.sh:ro
+      - postgres-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+volumes:
+  postgres-data:
+  postgres-backups:
+  redis-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  backend:
+    internal: true
+  edge:

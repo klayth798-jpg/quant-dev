@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from quantdev.analytics import excess_metrics, summarize_equity
 from quantdev.models import BacktestRequest
+from quantdev.money import round_money, to_decimal
 from quantdev.services.factors import factor_service
 from quantdev.store import new_id, store, utc_now
 
@@ -135,7 +136,15 @@ class BacktestService:
             return "down"
         return ""
 
-    def run(self, request: BacktestRequest) -> Dict[str, Any]:
+    def run(
+        self,
+        request: BacktestRequest,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if run_id:
+            existing = store.get_backtest(run_id)
+            if existing:
+                return existing
         snapshot_id = store.latest_snapshot_id()
         if not snapshot_id:
             raise ValueError("没有可用的数据快照")
@@ -248,10 +257,20 @@ class BacktestService:
                     execution_price = self._execution_price(
                         close_map[symbol], "sell", request.slippage_bps
                     )
-                    gross = shares * execution_price
-                    commission = max(self.minimum_commission, gross * request.commission_rate)
-                    tax = gross * request.stamp_duty_rate
-                    cash += gross - commission - tax
+                    gross = round_money(shares * execution_price)
+                    commission = round_money(
+                        max(
+                            to_decimal(self.minimum_commission),
+                            to_decimal(gross) * to_decimal(request.commission_rate),
+                        )
+                    )
+                    tax = round_money(to_decimal(gross) * to_decimal(request.stamp_duty_rate))
+                    cash = round_money(
+                        to_decimal(cash)
+                        + to_decimal(gross)
+                        - to_decimal(commission)
+                        - to_decimal(tax)
+                    )
                     remaining = positions[symbol] - shares
                     if remaining:
                         positions[symbol] = remaining
@@ -295,19 +314,31 @@ class BacktestService:
                     shares_to_buy = max(0, target_shares - current_shares)
                     if shares_to_buy == 0:
                         continue
-                    gross = shares_to_buy * execution_price
-                    commission = max(self.minimum_commission, gross * request.commission_rate)
+                    gross = round_money(shares_to_buy * execution_price)
+                    commission = round_money(
+                        max(
+                            to_decimal(self.minimum_commission),
+                            to_decimal(gross) * to_decimal(request.commission_rate),
+                        )
+                    )
                     while shares_to_buy > 0 and gross + commission > cash:
                         shares_to_buy -= self.lot_size
-                        gross = shares_to_buy * execution_price
+                        gross = round_money(shares_to_buy * execution_price)
                         commission = (
-                            max(self.minimum_commission, gross * request.commission_rate)
+                            round_money(
+                                max(
+                                    to_decimal(self.minimum_commission),
+                                    to_decimal(gross) * to_decimal(request.commission_rate),
+                                )
+                            )
                             if shares_to_buy
                             else 0.0
                         )
                     if shares_to_buy <= 0:
                         continue
-                    cash -= gross + commission
+                    cash = round_money(
+                        to_decimal(cash) - to_decimal(gross) - to_decimal(commission)
+                    )
                     positions[symbol] = current_shares + shares_to_buy
                     total_turnover += gross
                     trades.append(
@@ -396,10 +427,13 @@ class BacktestService:
             for point, benchmark_value in zip(equity_curve, benchmark_curve):
                 point["benchmark"] = round(benchmark_value, 2)
         payload = {
-            "run_id": new_id("bt"),
+            "run_id": run_id or new_id("bt"),
             "name": request.name,
             "factor_id": request.factor_id,
             "snapshot_id": snapshot_id,
+            "manifest_id": (
+                store.latest_dataset_manifest(snapshot_id) or {}
+            ).get("manifest_id"),
             "config": request.model_dump(),
             "metrics": metrics,
             "equity_curve": equity_curve,
