@@ -59,9 +59,9 @@
 ## 阶段 5 — 对账（实盘真正的安全网）
 
 - [ ] `QUANTDEV_RECONCILIATION_INTERVAL_SECONDS`（默认 300s）：live runner 每轮按此间隔自动对账。
-- [ ] **必须运行一个 live 执行守护进程**：当前 `compose.prod.yml` 只有 `paper-runner`。实盘需让
-      runner 在 live 模式常驻（`paper-runner` 进程在 live 模式下会做 sync→恢复中间态→定时对账），
-      或新增 `live-runner` 服务。**没有常驻 runner，UNKNOWN 订单与漂移无人自动收敛。**
+- [ ] **必须运行一个 live 执行守护进程**：`compose.prod.yml` 已提供 `live-runner` profile。
+      实盘或 dry-run 演练时必须让它常驻，负责 sync→恢复中间态→定时对账。
+      **没有常驻 runner，UNKNOWN 订单与漂移无人自动收敛。**
 - [ ] `QUANTDEV_AUTO_KILL_ON_RECON_BREAK=true`（对账差异自动熔断）。
 - [ ] 接真实券商前，按需放宽 `QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS`（默认 0=精确到分），
       吸收券商费用/逐笔舍入口径的无害尾差，避免误触熔断。

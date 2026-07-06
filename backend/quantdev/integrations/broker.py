@@ -765,6 +765,67 @@ class GuardedBroker(BrokerAdapter):
         return self._delegate.health_check()
 
 
+class DryRunBroker(BrokerAdapter):
+    """真实 Broker dry-run 包装器：查询透传，交易动作只生成本地回执。
+
+    用途是先接入券商/柜台的只读查询能力，验证账户、持仓、委托和对账链路；在
+    `QUANTDEV_BROKER_DRY_RUN=true` 时，即使系统进入 live 模式，也不会向真实柜台发送
+    报单或撤单请求。
+    """
+
+    mode = "live"
+
+    def __init__(self, delegate: BrokerAdapter) -> None:
+        self._delegate = delegate
+
+    def submit_order(self, order: BrokerOrder) -> BrokerOrderAck:
+        return BrokerOrderAck(
+            accepted=True,
+            broker_order_id="dryrun:{}".format(order.client_order_id),
+            status="DRY_RUN",
+            filled_quantity=0,
+            message="dry-run：订单未发送到真实 Broker",
+        )
+
+    def cancel_order(self, broker_order_id: str) -> CancelAck:
+        return CancelAck(
+            accepted=True,
+            broker_order_id=broker_order_id,
+            status="CANCELLED",
+            message="dry-run：撤单未发送到真实 Broker",
+        )
+
+    def get_account(self) -> AccountSnapshot:
+        return self._delegate.get_account()
+
+    def get_positions(self) -> List[PositionSnapshot]:
+        return self._delegate.get_positions()
+
+    def get_orders(self) -> List[OrderSnapshot]:
+        return self._delegate.get_orders()
+
+    def get_trades(self) -> List[TradeSnapshot]:
+        return self._delegate.get_trades()
+
+    def query_order(self, broker_order_id: str) -> Optional[OrderSnapshot]:
+        if broker_order_id.startswith("dryrun:"):
+            return None
+        return self._delegate.query_order(broker_order_id)
+
+    def query_order_by_client_id(
+        self, client_order_id: str
+    ) -> Optional[OrderSnapshot]:
+        return self._delegate.query_order_by_client_id(client_order_id)
+
+    def health_check(self) -> BrokerHealth:
+        health = self._delegate.health_check()
+        return BrokerHealth(
+            healthy=health.healthy,
+            mode="live",
+            message="dry-run 查询透传；交易不会发送。{}".format(health.message),
+        )
+
+
 def get_broker() -> BrokerAdapter:
     """按生效的 broker 模式返回 Broker 实例。
 
@@ -783,6 +844,8 @@ def get_broker() -> BrokerAdapter:
                 raise TypeError("配置对象未实现 BrokerAdapter")
             if broker.health_check().mode != "live":
                 raise TypeError("真实 Broker health_check().mode 必须返回 live")
+            if settings.broker_dry_run:
+                broker = DryRunBroker(broker)
             return GuardedBroker(broker)
         except Exception as exc:
             return UnconfiguredLiveBroker(

@@ -1,3 +1,4 @@
+from quantdev.db import database
 from quantdev.money import (
     cents_to_yuan,
     money_equal,
@@ -45,6 +46,23 @@ def test_paper_account_cash_has_no_subcent_residue():
     # 现金等于其量化到分的值（无 0.30000000000000004 之类尾差）。
     assert round_money(cash) == cash
     assert to_cents(cash) == round(cash * 100)
+
+
+def test_money_cents_shadow_columns_are_synced_after_order():
+    paper_execution_service.submit(
+        _order("money-cents-shadow", "600519.SH", "buy")
+    )
+    with database.connect() as connection:
+        account = connection.execute(
+            "SELECT cash, cash_cents FROM paper_accounts WHERE account_id = ?",
+            (paper_execution_service.account_id,),
+        ).fetchone()
+        fill = connection.execute(
+            "SELECT price, price_cents, fees, fees_cents FROM paper_fills LIMIT 1"
+        ).fetchone()
+    assert account["cash_cents"] == to_cents(account["cash"])
+    assert fill["price_cents"] == to_cents(fill["price"])
+    assert fill["fees_cents"] == to_cents(fill["fees"])
 
 
 def _order(client_id, symbol, side):

@@ -44,7 +44,7 @@ OMS 和 Broker 适配器完成；Agent 负责解释证据，不能绕过硬风�
 | PostgreSQL | 生产环境研究数据、任务、账本、审批、订单与审计真相源 |
 | TushareSyncService | 主数据、交易日历、日线、财务和指数成分同步 |
 | QuoteService | 实时行情接收、时效判断、日线降级估值 |
-| FactorService | 历史面板评估与低内存最新截面计算 |
+| FactorService | 历史面板评估、后台刷新最新截面缓存和缓存读取 |
 | BacktestService | T 日信号、T+1 执行、成本和约束回测 |
 | StrategyRunnerService | 调仓周期、租约、目标仓位、订单意图和幂等运行 |
 | ExecutionRouter | 根据 `paper/live/disabled` 把意图送往正确执行域 |
@@ -106,17 +106,23 @@ stateDiagram-v2
   `QUANTDEV_BROKER_ADAPTER=模块路径:工厂函数` 加载；未配置时系统失败关闭，不会使用
   Mock Broker 代替。
 - SQLite 仅用于单机开发和测试；生产 Compose 强制使用 PostgreSQL。
-- 数据同步、因子评估和回测先写 `task_jobs`，再投递 Redis。Redis 只负责唤醒，
+- 数据同步、因子评估、因子最新截面分数和回测先写 `task_jobs`，再投递 Redis。Redis 只负责唤醒，
   PostgreSQL 保存任务状态，因此 Worker 或 Redis 重启不会丢失任务。
+- `/api/factors/{factor_id}/scores` 只读取 `factor_score_snapshots` 缓存；缓存缺失时必须由
+  `/api/factors/{factor_id}/scores/refresh` 后台任务刷新，避免 Web 进程同步做全市场计算。
 - `schema_migrations` 记录数据库版本；部署时 `migrate` 一次性容器成功后才启动 API。
 - 同步完成会生成密封 Manifest，并将回测和策略运行绑定到 `manifest_id`。Manifest
   记录数据水位和行数，但底层活动 SQLite 仍允许增量修订；严格逐字节复现仍应输出
   不可变 Parquet 分区。
-- 当前审批是持久化单操作员审批，不等于企业级 RBAC 或双人复核。
+- 权限分三层：`X-Read-Key` 对应只读研究接口，`X-Admin-Key` 对应管理写接口，
+  `QUANTDEV_OPERATOR_KEYS` 对应绑定身份的操作员密钥。生产双人复核应使用不同操作员密钥
+  完成“审批”和“提交”。
+- 真实 Broker 默认可由 `QUANTDEV_BROKER_DRY_RUN=true` 包装为 dry-run：查询透传，报单/撤单
+  不发送到真实柜台。就绪度会在 dry-run 开启时阻断真实下单阶段。
 - **金额定点数**：现金、费用、成交额、权益等金额由 `quantdev.money` 用 `Decimal`
   量化到“分”后再写库/比较，杜绝浮点漂移；对账按整数“分”精确比较，消除浮点假差异
-  （false break）。存储列暂沿用 float（SQLite 无原生 Decimal），但写入前一律量化、
-  累积运算一律走 Decimal，因此现金/PnL 始终是精确的“分”。
+  （false break）。账本表已新增 `*_cents BIGINT` 影子列并在写入后同步，旧 float/REAL
+  字段暂保留用于兼容现有接口；后续可逐步把读取和报表切到 cents/NUMERIC。
 
 ## 回测/因子可信度边界（接真实数据前必读）
 

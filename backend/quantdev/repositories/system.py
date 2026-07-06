@@ -160,3 +160,86 @@ class SystemRepository:
             item["payload"] = decode_json(item.pop("payload_json"))
             result.append(item)
         return result
+
+    def refresh_money_cents(self) -> None:
+        """同步金额影子列（元 -> 分）。
+
+        这是 float/REAL 到 cents/NUMERIC 的渐进迁移桥：旧列继续服务现有读取逻辑，
+        新列提供生产账本逐步切换所需的整数金额真相。
+        """
+        updates = (
+            (
+                "paper_accounts",
+                {
+                    "cash_cents": "cash",
+                    "reserved_cash_cents": "reserved_cash",
+                    "initial_cash_cents": "initial_cash",
+                },
+            ),
+            ("paper_positions", {"average_cost_cents": "average_cost"}),
+            (
+                "paper_orders",
+                {
+                    "limit_price_cents": "limit_price",
+                    "average_fill_price_cents": "average_fill_price",
+                    "reserved_cash_cents": "reserved_cash",
+                },
+            ),
+            ("paper_fills", {"price_cents": "price", "fees_cents": "fees"}),
+            (
+                "account_daily_snapshots",
+                {
+                    "start_equity_cents": "start_equity",
+                    "current_equity_cents": "current_equity",
+                    "daily_pnl_cents": "daily_pnl",
+                },
+            ),
+            (
+                "live_orders",
+                {
+                    "limit_price_cents": "limit_price",
+                    "average_fill_price_cents": "average_fill_price",
+                },
+            ),
+            ("live_trades", {"price_cents": "price", "fees_cents": "fees"}),
+            (
+                "live_account_state",
+                {"cash_cents": "cash", "initial_cash_cents": "initial_cash"},
+            ),
+            (
+                "live_account_daily_snapshots",
+                {
+                    "start_equity_cents": "start_equity",
+                    "current_equity_cents": "current_equity",
+                    "daily_pnl_cents": "daily_pnl",
+                },
+            ),
+            ("live_positions", {"average_cost_cents": "average_cost"}),
+            ("reconciliations", {"cash_diff_cents": "cash_diff"}),
+            (
+                "mock_broker_orders",
+                {
+                    "limit_price_cents": "limit_price",
+                    "average_fill_price_cents": "average_fill_price",
+                },
+            ),
+            ("mock_broker_trades", {"price_cents": "price"}),
+            (
+                "mock_broker_accounts",
+                {"cash_cents": "cash", "initial_cash_cents": "initial_cash"},
+            ),
+            ("mock_broker_positions", {"average_cost_cents": "average_cost"}),
+        )
+        with database.transaction(immediate=True) as connection:
+            for table, columns in updates:
+                assignments = [
+                    "{target} = CASE WHEN {source} IS NULL THEN NULL "
+                    "ELSE CAST(ROUND({source} * 100) AS BIGINT) END".format(
+                        target=target,
+                        source=source,
+                    )
+                    for target, source in columns.items()
+                ]
+                connection.execute(
+                    "UPDATE {} SET {}".format(table, ", ".join(assignments))
+                )

@@ -562,6 +562,30 @@ def test_admin_write_requires_matching_key(monkeypatch):
         assert ok.status_code == 200
 
 
+def test_read_key_protects_business_read_endpoints(monkeypatch):
+    """配置 read key 后，业务读接口需要 read/admin/operator 任一有效密钥。"""
+    monkeypatch.setattr(
+        api_module,
+        "settings",
+        replace(
+            api_module.settings,
+            read_api_key="read-secret",
+            admin_api_key="admin-secret",
+            admin_allow_insecure=False,
+        ),
+    )
+    with TestClient(app) as client:
+        assert client.get("/api/dashboard").status_code == 401
+        assert (
+            client.get("/api/dashboard", headers={"X-Read-Key": "read-secret"}).status_code
+            == 200
+        )
+        assert (
+            client.get("/api/dashboard", headers={"X-Admin-Key": "admin-secret"}).status_code
+            == 200
+        )
+
+
 def test_operator_keys_bind_identity_to_credential(monkeypatch):
     """每操作员独立密钥：身份由密钥反查派生，忽略客户端可伪造的 X-Operator（MC-1）。"""
     from fastapi import HTTPException

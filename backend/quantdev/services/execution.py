@@ -498,6 +498,7 @@ class PaperExecutionService:
             live_guard.activate_kill_switch(
                 activate_kill_reason, actor="daily-loss-guard"
             )
+        store.refresh_money_cents()
         if idempotent:
             return {
                 "idempotent": True,
@@ -793,6 +794,7 @@ class PaperExecutionService:
                 "order": result,
                 "account": self.get_account(),
             }
+        store.refresh_money_cents()
         self._refresh_strategy_intent(result)
         event_bus.publish(
             "order.cancelled",
@@ -858,6 +860,8 @@ class PaperExecutionService:
                 )
         for order in matched_orders:
             self._refresh_strategy_intent(order)
+        if matched:
+            store.refresh_money_cents()
         return {"matched": matched, "skipped": skipped, "reason": ""}
 
     def recover_active_orders(self) -> Dict[str, Any]:

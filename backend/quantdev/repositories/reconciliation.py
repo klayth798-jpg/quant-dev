@@ -30,6 +30,7 @@ class ReconciliationRepository:
                     utc_now(),
                 ),
             )
+        self.refresh_money_cents()
         return recon_id
 
     def list_reconciliations(self, limit: int = 20) -> List[Dict[str, Any]]:

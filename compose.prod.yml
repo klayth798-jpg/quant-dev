@@ -10,10 +10,13 @@ x-app-environment: &app-environment
   QUANTDEV_TASK_MAX_ATTEMPTS: ${QUANTDEV_TASK_MAX_ATTEMPTS:-3}
   QUANTDEV_TASK_VISIBILITY_TIMEOUT_SECONDS: ${QUANTDEV_TASK_VISIBILITY_TIMEOUT_SECONDS:-1800}
   QUANTDEV_WORKER_POLL_SECONDS: ${QUANTDEV_WORKER_POLL_SECONDS:-5}
+  QUANTDEV_READ_API_KEY: ${QUANTDEV_READ_API_KEY:?set QUANTDEV_READ_API_KEY}
   QUANTDEV_ADMIN_API_KEY: ${QUANTDEV_ADMIN_API_KEY:?set QUANTDEV_ADMIN_API_KEY}
+  QUANTDEV_OPERATOR_KEYS: ${QUANTDEV_OPERATOR_KEYS:-}
   QUANTDEV_REQUIRE_DUAL_APPROVAL: ${QUANTDEV_REQUIRE_DUAL_APPROVAL:-true}
   QUANTDEV_ALERT_WEBHOOK_URL: ${QUANTDEV_ALERT_WEBHOOK_URL:-}
   QUANTDEV_RECONCILIATION_INTERVAL_SECONDS: ${QUANTDEV_RECONCILIATION_INTERVAL_SECONDS:-300}
+  QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS: ${QUANTDEV_RECONCILIATION_CASH_TOLERANCE_CENTS:-0}
   MARKET_DATA_SDK: ${MARKET_DATA_SDK:-tushare}
   TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
   TINYSHARE_TOKEN: ${TINYSHARE_TOKEN:-}
@@ -22,6 +25,7 @@ x-app-environment: &app-environment
   TUSHARE_DEFAULT_INDICES: ${TUSHARE_DEFAULT_INDICES:-000300.SH,000905.SH,000852.SH}
   QUANTDEV_BROKER_MODE: ${QUANTDEV_BROKER_MODE:-disabled}
   QUANTDEV_BROKER_ADAPTER: ${QUANTDEV_BROKER_ADAPTER:-}
+  QUANTDEV_BROKER_DRY_RUN: ${QUANTDEV_BROKER_DRY_RUN:-true}
   QUANTDEV_LIVE_TRADING_ENABLED: ${QUANTDEV_LIVE_TRADING_ENABLED:-false}
   QUANTDEV_REQUIRE_ORDER_APPROVAL: ${QUANTDEV_REQUIRE_ORDER_APPROVAL:-true}
   QUANTDEV_MAX_LIVE_ORDER_NOTIONAL: ${QUANTDEV_MAX_LIVE_ORDER_NOTIONAL:-5000}
@@ -137,6 +141,21 @@ services:
       dockerfile: infra/Dockerfile
     profiles: ["paper-live"]
     command: ["python", "-m", "quantdev.cli", "paper-runner"]
+    restart: unless-stopped
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend]
+
+  live-runner:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    profiles: ["live"]
+    command: ["python", "-m", "quantdev.cli", "live-runner"]
     restart: unless-stopped
     environment: *app-environment
     depends_on:

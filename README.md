@@ -20,6 +20,8 @@
 - FastAPI 和零构建 Web 工作台
 - PostgreSQL 生产账本、版本化迁移和 SQLite 批量迁移
 - Redis 持久任务队列、独立 Worker、失败重试和超时恢复
+- 因子截面分数后台预计算与缓存读取
+- 只读密钥、管理员密钥、操作员密钥三层权限边界
 
 实盘交易默认从代码层禁用。
 
@@ -159,6 +161,9 @@ infra/                   容器部署
 - 不允许把 `.env`、API Key、券商密钥提交到 Git。
 - Agent 仅依赖因子、回测和风险读取接口。
 - `live` 模式未配置真实适配器时使用失败关闭边界，绝不会回退到 Mock Broker。
-- 管理写接口支持 `X-Admin-Key`；真实资金前仍应升级为正式登录、RBAC 和双人审批。
+- 业务读接口可配置 `QUANTDEV_READ_API_KEY` 并使用 `X-Read-Key`；写接口使用
+  `X-Admin-Key`；实盘审批/提交建议配置 `QUANTDEV_OPERATOR_KEYS` 绑定操作员身份。
 - 实盘审批会保存操作人、理由、请求哈希和过期时间；订单参数变化后原审批自动失效。
+- 真实 Broker 默认 `QUANTDEV_BROKER_DRY_RUN=true`，先验证只读查询和对账链路，显式关闭
+  dry-run 后才允许进入真实下单就绪阶段。
 - `MockLiveBroker` 仅用于异常压测，不代表已经接入真实券商。

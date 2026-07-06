@@ -1,4 +1,4 @@
-.PHONY: install install-tinyshare dev test lint bootstrap reset-real worker paper-runner verify-broker
+.PHONY: install install-tinyshare dev test lint bootstrap reset-real worker paper-runner live-runner verify-broker
 
 install:
 	python3 -m venv .venv
@@ -28,6 +28,9 @@ worker:
 
 paper-runner:
 	.venv/bin/python -m quantdev.cli paper-runner
+
+live-runner:
+	.venv/bin/python -m quantdev.cli live-runner
 
 verify-broker:
 	.venv/bin/python -m quantdev.cli verify-broker

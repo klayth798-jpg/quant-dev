@@ -106,6 +106,23 @@ def test_factor_api_returns_queryable_task():
     assert detail.json()["result"]["factor_id"] == "momentum_20"
 
 
+def test_factor_score_endpoint_reads_cached_task_result():
+    with TestClient(app) as client:
+        missing = client.get("/api/factors/momentum_20/scores")
+        assert missing.status_code == 404
+
+        queued = client.post("/api/factors/momentum_20/scores/refresh")
+        task = queued.json()
+        scores = client.get("/api/factors/momentum_20/scores?limit=5")
+
+    assert queued.status_code == 202
+    assert task["status"] == "COMPLETED"
+    assert task["result"]["score_count"] > 0
+    assert scores.status_code == 200
+    assert scores.json()["count"] > 0
+    assert len(scores.json()["top"]) <= 5
+
+
 def test_backtest_retry_reuses_preallocated_run_id():
     run_id = new_id("bt")
     first = backtest_service.run(BacktestRequest(), run_id=run_id)

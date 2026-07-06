@@ -218,6 +218,7 @@ class OrderRepository:
                 """,
                 (order_id, request_hash, now, intent["intent_id"]),
             )
+        self.refresh_money_cents()
         return self.get_live_order(order_id), True
 
     def get_live_order(self, order_id: str) -> Optional[Dict[str, Any]]:
@@ -268,6 +269,7 @@ class OrderRepository:
             "CANCELLED",
             "PARTIALLY_CANCELLED",
             "REJECTED",
+            "DRY_RUN",
         }
         terminal = status in terminal_statuses
         with database.transaction(immediate=True) as connection:
@@ -333,6 +335,7 @@ class OrderRepository:
                     current["intent_id"],
                 ),
             )
+        self.refresh_money_cents()
         return self.get_live_order(order_id)
 
     def save_live_trade(
@@ -361,6 +364,7 @@ class OrderRepository:
                     utc_now(),
                 ),
             ).rowcount
+        self.refresh_money_cents()
         return bool(inserted)
 
     def sync_live_account_state(
@@ -414,6 +418,7 @@ class OrderRepository:
                     for item in positions
                 ],
             )
+        self.refresh_money_cents()
 
     def update_live_daily_snapshot(
         self, account_id: str, trade_date: str, equity: float
@@ -476,6 +481,7 @@ class OrderRepository:
                     now,
                 ),
             )
+        self.refresh_money_cents()
         return {
             "account_id": account_id,
             "trade_date": trade_date,

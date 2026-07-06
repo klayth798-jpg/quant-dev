@@ -2,7 +2,7 @@ import hmac
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,29 +48,74 @@ from quantdev.services.tushare_sync import tushare_sync_service
 from quantdev.store import new_id, store
 
 
-def require_admin(
-    x_admin_key: str = Header(default=""),
-    x_operator: str = Header(default="local-admin"),
-) -> str:
+def _resolve_privileged_actor(
+    provided_key: str,
+    x_operator: str = "local-admin",
+) -> Optional[str]:
+    if not provided_key:
+        return None
     # 每操作员独立密钥（推荐，sec-1/MC-1）：身份由密钥反查派生，不信任客户端自报的
     # X-Operator 头，使双人复核可信。配置 QUANTDEV_OPERATOR_KEYS 后即取代单一共享 key。
     if settings.operator_keys:
-        for key, operator in settings.operator_keys.items():
-            if hmac.compare_digest(x_admin_key, key):
+        for configured_key, operator in settings.operator_keys.items():
+            if hmac.compare_digest(provided_key, configured_key):
                 return operator
-        raise HTTPException(status_code=401, detail="管理员密钥无效")
+        return None
+    if settings.admin_api_key and hmac.compare_digest(provided_key, settings.admin_api_key):
+        return x_operator
+    return None
+
+
+def require_read(
+    x_read_key: str = Header(default=""),
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+    x_admin_key: str = Header(default=""),
+    x_operator: str = Header(default="local-admin"),
+) -> str:
+    """只读接口鉴权：read key、admin key、operator key 任一有效即可读取。"""
+    for candidate in (x_read_key, x_api_key):
+        if settings.read_api_key and hmac.compare_digest(candidate, settings.read_api_key):
+            return "read-only"
+    actor = _resolve_privileged_actor(x_admin_key or x_api_key, x_operator)
+    if actor:
+        return actor
+    if not settings.read_api_key:
+        return "public-read"
+    raise HTTPException(status_code=401, detail="只读密钥无效")
+
+
+def require_admin(
+    x_admin_key: str = Header(default=""),
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+    x_operator: str = Header(default="local-admin"),
+) -> str:
+    actor = _resolve_privileged_actor(x_admin_key or x_api_key, x_operator)
+    if actor:
+        return actor
+    if settings.operator_keys:
+        raise HTTPException(status_code=401, detail="操作员密钥无效")
     if not settings.admin_api_key:
         # 安全默认：未配置管理员密钥时，写操作一律关闭。仅当显式开启
         # QUANTDEV_ALLOW_INSECURE_ADMIN（本地开发/测试）才放行，避免“一字之差全开”。
-        if not settings.admin_allow_insecure:
+        if settings.operator_keys or not settings.admin_allow_insecure:
             raise HTTPException(
                 status_code=503,
                 detail="未配置 QUANTDEV_ADMIN_API_KEY，写操作已关闭",
             )
         return x_operator
-    if not hmac.compare_digest(x_admin_key, settings.admin_api_key):
-        raise HTTPException(status_code=401, detail="管理员密钥无效")
-    return x_operator
+    raise HTTPException(status_code=401, detail="管理员密钥无效")
+
+
+def require_operator(actor: str = Depends(require_admin)) -> str:
+    """交易审批/提交需要可信 actor；生产配置 operator key 后身份由密钥绑定。"""
+    if settings.operator_keys:
+        return actor
+    if settings.environment == "production" and settings.require_dual_approval:
+        raise HTTPException(
+            status_code=503,
+            detail="生产双人复核需要配置 QUANTDEV_OPERATOR_KEYS",
+        )
+    return actor
 
 
 def _ensure_demo_results() -> None:
@@ -239,13 +284,13 @@ def get_reconciliation(recon_id: str) -> Dict[str, Any]:
     return report
 
 
-@app.get("/api/live/market-clock")
+@app.get("/api/live/market-clock", dependencies=[Depends(require_read)])
 def market_clock() -> Dict[str, Any]:
     """A股交易时钟：当前是否交易日、是否交易时段、是否允许下单。"""
     return asdict(trading_calendar_service.market_clock())
 
 
-@app.get("/api/live/tradability/{symbol}")
+@app.get("/api/live/tradability/{symbol}", dependencies=[Depends(require_read)])
 def tradability(symbol: str) -> Dict[str, Any]:
     """标的可交易性：是否停牌、当日涨跌停价与幅度。"""
     return asdict(tradability_service.evaluate(symbol))
@@ -269,13 +314,13 @@ def list_events(
     }
 
 
-@app.get("/api/live/readiness")
+@app.get("/api/live/readiness", dependencies=[Depends(require_read)])
 def live_readiness() -> Dict[str, Any]:
     """实盘路线 5 阶段就绪度自检：逐项校验每个阶段的进入条件。"""
     return live_readiness_service.evaluate()
 
 
-@app.get("/api/dashboard")
+@app.get("/api/dashboard", dependencies=[Depends(require_read)])
 def dashboard() -> Dict[str, Any]:
     factors = store.list_factors()
     backtests = store.list_backtests(limit=5)
@@ -322,24 +367,24 @@ def bootstrap_demo(force: bool = False) -> Dict[str, Any]:
     return result
 
 
-@app.get("/api/instruments")
+@app.get("/api/instruments", dependencies=[Depends(require_read)])
 def instruments() -> Dict[str, Any]:
     return {"items": store.list_instruments()}
 
 
-@app.get("/api/data/status")
+@app.get("/api/data/status", dependencies=[Depends(require_read)])
 def data_status() -> Dict[str, Any]:
     return tushare_sync_service.status()
 
 
-@app.get("/api/data/sync-runs")
+@app.get("/api/data/sync-runs", dependencies=[Depends(require_read)])
 def data_sync_runs(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> Dict[str, Any]:
     return {"items": store.list_data_sync_runs(limit=limit)}
 
 
-@app.get("/api/data/sync-runs/{run_id}")
+@app.get("/api/data/sync-runs/{run_id}", dependencies=[Depends(require_read)])
 def data_sync_run(run_id: str) -> Dict[str, Any]:
     try:
         return tushare_sync_service.get_run(run_id)
@@ -382,12 +427,12 @@ def sync_tushare(
     return {**run, "task_id": job["task_id"], "task_status": job["status"]}
 
 
-@app.get("/api/data/indices")
+@app.get("/api/data/indices", dependencies=[Depends(require_read)])
 def data_indices() -> Dict[str, Any]:
     return {"items": store.list_indices()}
 
 
-@app.get("/api/data/financials/{symbol}")
+@app.get("/api/data/financials/{symbol}", dependencies=[Depends(require_read)])
 def data_financials(
     symbol: str,
     limit: int = Query(default=20, ge=1, le=100),
@@ -395,7 +440,7 @@ def data_financials(
     return {"symbol": symbol, "items": store.list_financial_indicators(symbol, limit)}
 
 
-@app.get("/api/market/prices")
+@app.get("/api/market/prices", dependencies=[Depends(require_read)])
 def market_prices(
     symbol: str = Query(..., min_length=3),
     limit: int = Query(default=260, ge=20, le=1000),
@@ -406,9 +451,83 @@ def market_prices(
     return {"symbol": symbol, "items": rows[-limit:]}
 
 
-@app.get("/api/factors")
+@app.get("/api/factors", dependencies=[Depends(require_read)])
 def factors() -> Dict[str, Any]:
     return {"items": store.list_factors(), "snapshot_id": store.latest_snapshot_id()}
+
+
+@app.get("/api/factors/{factor_id}/scores", dependencies=[Depends(require_read)])
+def factor_scores(
+    factor_id: str,
+    neutralize: bool = False,
+    limit: int = Query(default=60, ge=1, le=500),
+) -> Dict[str, Any]:
+    """某因子在最新交易日的全市场截面打分缓存（排名榜 / 选股依据）。"""
+    snapshot_id = store.latest_snapshot_id()
+    if not snapshot_id:
+        raise HTTPException(status_code=404, detail="没有可用的数据快照")
+    as_of = store.snapshot_max_date(snapshot_id)
+    if not as_of:
+        raise HTTPException(status_code=404, detail="数据快照没有交易日期")
+    cache = store.get_factor_score_snapshot(
+        factor_id, snapshot_id, as_of, neutralize=neutralize
+    )
+    if cache is None:
+        raise HTTPException(
+            status_code=404,
+            detail="该因子最新截面尚未缓存，请先调用 /api/factors/{}/scores/refresh".format(
+                factor_id
+            ),
+        )
+    return _factor_score_payload(cache, limit)
+
+
+@app.post(
+    "/api/factors/{factor_id}/scores/refresh",
+    status_code=202,
+    dependencies=[Depends(require_admin)],
+)
+def refresh_factor_scores(
+    factor_id: str,
+    neutralize: bool = False,
+) -> Dict[str, Any]:
+    """后台刷新某因子最新截面分数缓存。"""
+    try:
+        return task_service.submit(
+            "factor_scores",
+            {
+                "factor_id": factor_id,
+                "neutralize": neutralize,
+            },
+        )
+    except TaskQueueUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _factor_score_payload(cache: Dict[str, Any], limit: int) -> Dict[str, Any]:
+    instruments = {item["symbol"]: item for item in store.list_instruments()}
+    ranked = sorted(cache["scores"].items(), key=lambda kv: kv[1], reverse=True)
+    items = [
+        {
+            "symbol": symbol,
+            "score": round(float(score), 4),
+            "name": instruments.get(symbol, {}).get("name", ""),
+            "industry": instruments.get(symbol, {}).get("industry", ""),
+        }
+        for symbol, score in ranked
+    ]
+    return {
+        "factor_id": cache["factor_id"],
+        "snapshot_id": cache["snapshot_id"],
+        "signal_date": cache["signal_date"],
+        "neutralize": cache["neutralize"],
+        "cached_at": cache["created_at"],
+        "count": len(items),
+        "top": items[:limit],
+        "bottom": items[-limit:][::-1],
+    }
 
 
 @app.post(
@@ -434,7 +553,7 @@ def evaluate_factor(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/backtests")
+@app.get("/api/backtests", dependencies=[Depends(require_read)])
 def backtests(limit: int = Query(default=20, ge=1, le=100)) -> Dict[str, Any]:
     return {"items": store.list_backtests(limit=limit)}
 
@@ -459,7 +578,7 @@ def run_backtest(request: BacktestRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/backtests/{run_id}")
+@app.get("/api/backtests/{run_id}", dependencies=[Depends(require_read)])
 def backtest_detail(run_id: str) -> Dict[str, Any]:
     result = store.get_backtest(run_id)
     if not result:
@@ -467,7 +586,7 @@ def backtest_detail(run_id: str) -> Dict[str, Any]:
     return result
 
 
-@app.get("/api/tasks")
+@app.get("/api/tasks", dependencies=[Depends(require_read)])
 def tasks(
     limit: int = Query(default=50, ge=1, le=200),
     status: str = Query(default=None),
@@ -475,7 +594,7 @@ def tasks(
     return {"items": store.list_task_jobs(limit=limit, status=status)}
 
 
-@app.get("/api/tasks/{task_id}")
+@app.get("/api/tasks/{task_id}", dependencies=[Depends(require_read)])
 def task_detail(task_id: str) -> Dict[str, Any]:
     task = store.get_task_job(task_id)
     if not task:
@@ -517,7 +636,7 @@ def match_paper_orders(symbol: str = Query(default=None)) -> Dict[str, Any]:
     return paper_execution_service.match_open_orders(symbol)
 
 
-@app.get("/api/paper/orders/{order_id}/events")
+@app.get("/api/paper/orders/{order_id}/events", dependencies=[Depends(require_read)])
 def paper_order_events(order_id: str) -> Dict[str, Any]:
     events = store.list_order_events(order_id)
     if not events:
@@ -525,7 +644,7 @@ def paper_order_events(order_id: str) -> Dict[str, Any]:
     return {"order_id": order_id, "events": events}
 
 
-@app.get("/api/live/quotes")
+@app.get("/api/live/quotes", dependencies=[Depends(require_read)])
 def list_quotes() -> Dict[str, Any]:
     return {"items": store.list_market_quotes()}
 
@@ -538,7 +657,7 @@ def update_quote(request: QuoteUpdateRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/strategies")
+@app.get("/api/strategies", dependencies=[Depends(require_read)])
 def list_strategies() -> Dict[str, Any]:
     return {"items": strategy_runner_service.list()}
 
@@ -572,14 +691,14 @@ def run_strategy(request: StrategyRunRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.get("/api/strategies/runs")
+@app.get("/api/strategies/runs", dependencies=[Depends(require_read)])
 def list_strategy_runs(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> Dict[str, Any]:
     return {"items": strategy_runner_service.list_runs(limit)}
 
 
-@app.get("/api/strategies/runs/{run_id}")
+@app.get("/api/strategies/runs/{run_id}", dependencies=[Depends(require_read)])
 def strategy_run_detail(run_id: str) -> Dict[str, Any]:
     try:
         return strategy_runner_service.get_run(run_id)
@@ -591,7 +710,7 @@ def strategy_run_detail(run_id: str) -> Dict[str, Any]:
 def approve_strategy_intent(
     intent_id: str,
     request: IntentApprovalRequest,
-    actor: str = Depends(require_admin),
+    actor: str = Depends(require_operator),
 ) -> Dict[str, Any]:
     try:
         return live_execution_service.approve_intent(
@@ -605,7 +724,7 @@ def approve_strategy_intent(
 def reject_strategy_intent(
     intent_id: str,
     request: IntentRejectRequest,
-    actor: str = Depends(require_admin),
+    actor: str = Depends(require_operator),
 ) -> Dict[str, Any]:
     try:
         return live_execution_service.reject_intent(
@@ -617,7 +736,7 @@ def reject_strategy_intent(
 
 @app.post("/api/strategies/intents/{intent_id}/submit")
 def submit_strategy_intent(
-    intent_id: str, actor: str = Depends(require_admin)
+    intent_id: str, actor: str = Depends(require_operator)
 ) -> Dict[str, Any]:
     try:
         return live_execution_service.submit_intent(intent_id, actor=actor)
@@ -630,7 +749,7 @@ def agent_research(request: AgentResearchRequest) -> Dict[str, Any]:
     return research_agent_service.research(request)
 
 
-@app.get("/api/system/requirements")
+@app.get("/api/system/requirements", dependencies=[Depends(require_read)])
 def system_requirements() -> Dict[str, Any]:
     market_provider = (
         "Tinyshare 代理接口"

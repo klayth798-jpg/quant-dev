@@ -243,6 +243,11 @@ class LiveReadinessService:
                 "当前适配器模式={}".format(broker_health.mode),
             ),
             _check(
+                "真实下单 dry-run 已关闭",
+                not settings.broker_dry_run,
+                "broker_dry_run={}".format(settings.broker_dry_run),
+            ),
+            _check(
                 "交易日历覆盖当前日期",
                 clock.calendar_source == "calendar",
                 "calendar_source={}".format(clock.calendar_source),

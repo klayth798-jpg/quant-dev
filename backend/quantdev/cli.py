@@ -25,6 +25,7 @@ def main() -> None:
             "sync-market",
             "worker",
             "paper-runner",
+            "live-runner",
             "verify-broker",
         ],
     )
@@ -91,6 +92,21 @@ def main() -> None:
         else:
             task_service.loop()
     elif args.command == "paper-runner":
+        from quantdev.alerting import install_event_alerts
+        from quantdev.services.strategy import strategy_runner_service
+
+        install_event_alerts()
+        if args.once:
+            print(
+                json.dumps(
+                    strategy_runner_service.run_enabled(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            strategy_runner_service.loop()
+    elif args.command == "live-runner":
         from quantdev.alerting import install_event_alerts
         from quantdev.services.strategy import strategy_runner_service
 

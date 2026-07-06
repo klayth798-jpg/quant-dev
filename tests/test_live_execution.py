@@ -399,7 +399,12 @@ def test_real_broker_wrapped_and_guarded(live_ready, monkeypatch):
     monkeypatch.setattr(
         broker_module,
         "settings",
-        replace(broker_module.settings, broker_mode="live", broker_adapter="x:make"),
+        replace(
+            broker_module.settings,
+            broker_mode="live",
+            broker_adapter="x:make",
+            broker_dry_run=False,
+        ),
     )
     monkeypatch.setattr(
         broker_module.importlib,
@@ -434,3 +439,44 @@ def test_real_broker_wrapped_and_guarded(live_ready, monkeypatch):
     with pytest.raises(PermissionError, match="安全守卫拒绝"):
         broker.submit_order(order)
     assert len(fake.submitted) == 1
+
+
+def test_real_broker_dry_run_does_not_submit_to_delegate(live_ready, monkeypatch):
+    import types
+
+    import quantdev.integrations.broker as broker_module
+    from quantdev.integrations.broker import get_broker
+
+    fake = _RecordingLiveBroker()
+    monkeypatch.setattr(
+        broker_module,
+        "settings",
+        replace(
+            broker_module.settings,
+            broker_mode="live",
+            broker_adapter="x:make",
+            broker_dry_run=True,
+        ),
+    )
+    monkeypatch.setattr(
+        broker_module.importlib,
+        "import_module",
+        lambda name: types.SimpleNamespace(make=lambda: fake),
+    )
+
+    broker = get_broker()
+    ack = broker.submit_order(
+        BrokerOrder(
+            client_order_id="dry-run-1",
+            symbol="600519.SH",
+            side="buy",
+            quantity=200,
+            order_type="limit",
+            limit_price=10,
+            approved=True,
+        )
+    )
+
+    assert ack.status == "DRY_RUN"
+    assert ack.broker_order_id == "dryrun:dry-run-1"
+    assert fake.submitted == []

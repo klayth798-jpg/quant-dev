@@ -43,6 +43,9 @@ services:
       QUANTDEV_DATABASE_URL: postgresql://quantdev:${POSTGRES_PASSWORD:-quantdev-local}@postgres:5432/quantdev
       QUANTDEV_TASK_BACKEND: redis
       QUANTDEV_REDIS_URL: redis://:${REDIS_PASSWORD:-quantdev-local}@redis:6379/0
+      QUANTDEV_ADMIN_API_KEY: ${QUANTDEV_ADMIN_API_KEY:-quantdev-local-admin}
+      QUANTDEV_OPERATOR_KEYS: ${QUANTDEV_OPERATOR_KEYS:-}
+      QUANTDEV_BROKER_DRY_RUN: ${QUANTDEV_BROKER_DRY_RUN:-true}
       MARKET_DATA_SDK: ${MARKET_DATA_SDK:-tushare}
       TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
       TINYSHARE_TOKEN: ${TINYSHARE_TOKEN:-}
@@ -81,6 +84,19 @@ services:
       dockerfile: infra/Dockerfile
     profiles: ["paper-live"]
     command: ["python", "-m", "quantdev.cli", "paper-runner"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  live-runner:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    profiles: ["live"]
+    command: ["python", "-m", "quantdev.cli", "live-runner"]
     environment: *app-environment
     depends_on:
       migrate:

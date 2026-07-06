@@ -150,6 +150,19 @@ class TaskService:
                 int(payload.get("forward_days", 5)),
                 bool(payload.get("neutralize", False)),
             )
+        if task_type == "factor_scores":
+            result = factor_service.refresh_latest_score_cache(
+                payload["factor_id"],
+                bool(payload.get("neutralize", False)),
+            )
+            return {
+                "factor_id": result["factor_id"],
+                "snapshot_id": result["snapshot_id"],
+                "signal_date": result["signal_date"],
+                "neutralize": result["neutralize"],
+                "score_count": result["score_count"],
+                "created_at": result["created_at"],
+            }
         if task_type == "backtest":
             result = backtest_service.run(
                 BacktestRequest.model_validate(payload["request"]),

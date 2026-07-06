@@ -248,6 +248,31 @@ class FactorService:
             "scores": scores,
         }
 
+    def refresh_latest_score_cache(
+        self,
+        factor_id: str,
+        neutralize: bool = False,
+    ) -> Dict[str, Any]:
+        snapshot_id = store.latest_snapshot_id()
+        if not snapshot_id:
+            raise ValueError("没有可用的数据快照")
+        as_of = store.snapshot_max_date(snapshot_id)
+        if not as_of:
+            raise ValueError("数据快照没有交易日期")
+        result = self.latest_cross_section(
+            factor_id,
+            snapshot_id,
+            as_of,
+            neutralize=neutralize,
+        )
+        return store.save_factor_score_snapshot(
+            factor_id=factor_id,
+            snapshot_id=snapshot_id,
+            signal_date=as_of,
+            neutralize=neutralize,
+            scores=result["scores"],
+        )
+
     def _latest_values(
         self,
         factor_id: str,

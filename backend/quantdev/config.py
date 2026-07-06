@@ -70,6 +70,7 @@ class Settings:
     approval_ttl_seconds: int
     reconciliation_max_age_minutes: int
     quote_max_spread_bps: float
+    read_api_key: str
     admin_api_key: str
     admin_allow_insecure: bool
     alert_webhook_url: str
@@ -77,6 +78,7 @@ class Settings:
     reconciliation_interval_seconds: int
     reconciliation_cash_tolerance_cents: int
     operator_keys: dict
+    broker_dry_run: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -168,6 +170,7 @@ class Settings:
             quote_max_spread_bps=float(
                 os.getenv("QUANTDEV_QUOTE_MAX_SPREAD_BPS", "100")
             ),
+            read_api_key=os.getenv("QUANTDEV_READ_API_KEY", ""),
             admin_api_key=os.getenv("QUANTDEV_ADMIN_API_KEY", ""),
             admin_allow_insecure=os.getenv(
                 "QUANTDEV_ALLOW_INSECURE_ADMIN", "false"
@@ -187,6 +190,8 @@ class Settings:
             operator_keys=_parse_operator_keys(
                 os.getenv("QUANTDEV_OPERATOR_KEYS", "")
             ),
+            broker_dry_run=os.getenv("QUANTDEV_BROKER_DRY_RUN", "true").lower()
+            == "true",
         )
 
 

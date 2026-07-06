@@ -160,6 +160,7 @@ tests/
 | `DEEP_RESEARCH_API_KEY` | 空 | 外部研究 Agent 鉴权预留 |
 | `QUANTDEV_BROKER_MODE` | `disabled` | `disabled`、`paper` 或 `live` |
 | `QUANTDEV_BROKER_ADAPTER` | 空 | 真实适配器工厂，格式 `module:factory` |
+| `QUANTDEV_BROKER_DRY_RUN` | `true` | 查询真实 Broker 但不发送真实报单/撤单 |
 | `QUANTDEV_PAPER_ENFORCE_SESSION` | `true` | 模拟实盘是否限制交易时段 |
 | `QUANTDEV_PAPER_QUOTE_MODE` | `realtime` | `realtime` 或收盘后验证用 `eod` |
 | `QUANTDEV_QUOTE_MAX_AGE_SECONDS` | `15` | 盘中行情最大年龄 |
@@ -168,7 +169,9 @@ tests/
 | `QUANTDEV_APPROVAL_TTL_SECONDS` | `300` | 实盘人工审批有效期 |
 | `QUANTDEV_RUNNER_LEASE_SECONDS` | `60` | 策略运行器租约时长 |
 | `QUANTDEV_RECONCILIATION_MAX_AGE_MINUTES` | `1440` | 就绪度允许的对账最大年龄 |
+| `QUANTDEV_READ_API_KEY` | 空 | 业务读接口只读密钥，生产 Compose 强制配置 |
 | `QUANTDEV_ADMIN_API_KEY` | 空 | 写接口管理员密钥 |
+| `QUANTDEV_OPERATOR_KEYS` | 空 | 操作员密钥，格式 `alice:keyA,bob:keyB` |
 
 授权码只应保存在本地 `.env` 或部署密钥系统中，不应出现在源码、文档、日志或 Git 历史里。
 
@@ -511,6 +514,8 @@ Agent 是系统中的分析层，不是交易执行层。
 | GET | `/api/data/financials/{symbol}` | 单只股票财务指标 |
 | GET | `/api/market/prices` | 单只股票最近行情 |
 | GET | `/api/factors` | 因子定义和最近评估 |
+| GET | `/api/factors/{factor_id}/scores` | 读取最新因子截面缓存 |
+| POST | `/api/factors/{factor_id}/scores/refresh` | 后台刷新最新因子截面缓存 |
 | POST | `/api/factors/{factor_id}/evaluate` | 因子评估 |
 | GET | `/api/backtests` | 回测列表 |
 | POST | `/api/backtests` | 运行回测 |
@@ -540,7 +545,9 @@ Agent 是系统中的分析层，不是交易执行层。
 
 Swagger 文档位于 `/docs`。
 
-写接口在配置 `QUANTDEV_ADMIN_API_KEY` 后要求请求头 `X-Admin-Key`。
+配置 `QUANTDEV_READ_API_KEY` 后，业务读接口要求 `X-Read-Key`，管理员/操作员密钥也可读取。
+写接口要求 `X-Admin-Key`；配置 `QUANTDEV_OPERATOR_KEYS` 后，审批与提交的 actor 由密钥反查
+绑定，不信任客户端自报身份。
 
 ## 15. 测试与质量检查
 

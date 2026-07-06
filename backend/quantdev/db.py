@@ -629,9 +629,119 @@ CREATE INDEX IF NOT EXISTS idx_task_jobs_status_created
 ON task_jobs(status, created_at);
 """
 
+FACTOR_CACHE_AND_MONEY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS factor_score_snapshots (
+    factor_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    signal_date TEXT NOT NULL,
+    neutralize INTEGER NOT NULL DEFAULT 0,
+    scores_json TEXT NOT NULL,
+    score_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (factor_id, snapshot_id, signal_date, neutralize),
+    FOREIGN KEY (factor_id) REFERENCES factor_definitions(factor_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_factor_score_snapshots_created
+ON factor_score_snapshots(created_at);
+
+ALTER TABLE paper_accounts ADD COLUMN cash_cents BIGINT;
+ALTER TABLE paper_accounts ADD COLUMN reserved_cash_cents BIGINT;
+ALTER TABLE paper_accounts ADD COLUMN initial_cash_cents BIGINT;
+ALTER TABLE paper_positions ADD COLUMN average_cost_cents BIGINT;
+ALTER TABLE paper_orders ADD COLUMN limit_price_cents BIGINT;
+ALTER TABLE paper_orders ADD COLUMN average_fill_price_cents BIGINT;
+ALTER TABLE paper_orders ADD COLUMN reserved_cash_cents BIGINT;
+ALTER TABLE paper_fills ADD COLUMN price_cents BIGINT;
+ALTER TABLE paper_fills ADD COLUMN fees_cents BIGINT;
+ALTER TABLE account_daily_snapshots ADD COLUMN start_equity_cents BIGINT;
+ALTER TABLE account_daily_snapshots ADD COLUMN current_equity_cents BIGINT;
+ALTER TABLE account_daily_snapshots ADD COLUMN daily_pnl_cents BIGINT;
+
+ALTER TABLE live_orders ADD COLUMN limit_price_cents BIGINT;
+ALTER TABLE live_orders ADD COLUMN average_fill_price_cents BIGINT;
+ALTER TABLE live_trades ADD COLUMN price_cents BIGINT;
+ALTER TABLE live_trades ADD COLUMN fees_cents BIGINT;
+ALTER TABLE live_account_state ADD COLUMN cash_cents BIGINT;
+ALTER TABLE live_account_state ADD COLUMN initial_cash_cents BIGINT;
+ALTER TABLE live_account_daily_snapshots ADD COLUMN start_equity_cents BIGINT;
+ALTER TABLE live_account_daily_snapshots ADD COLUMN current_equity_cents BIGINT;
+ALTER TABLE live_account_daily_snapshots ADD COLUMN daily_pnl_cents BIGINT;
+ALTER TABLE live_positions ADD COLUMN average_cost_cents BIGINT;
+ALTER TABLE reconciliations ADD COLUMN cash_diff_cents BIGINT;
+
+ALTER TABLE mock_broker_orders ADD COLUMN limit_price_cents BIGINT;
+ALTER TABLE mock_broker_orders ADD COLUMN average_fill_price_cents BIGINT;
+ALTER TABLE mock_broker_trades ADD COLUMN price_cents BIGINT;
+ALTER TABLE mock_broker_accounts ADD COLUMN cash_cents BIGINT;
+ALTER TABLE mock_broker_accounts ADD COLUMN initial_cash_cents BIGINT;
+ALTER TABLE mock_broker_positions ADD COLUMN average_cost_cents BIGINT;
+
+UPDATE paper_accounts
+SET cash_cents = CAST(ROUND(cash * 100) AS BIGINT),
+    reserved_cash_cents = CAST(ROUND(reserved_cash * 100) AS BIGINT),
+    initial_cash_cents = CAST(ROUND(initial_cash * 100) AS BIGINT);
+UPDATE paper_positions SET average_cost_cents = CAST(ROUND(average_cost * 100) AS BIGINT);
+UPDATE paper_orders
+SET limit_price_cents = CASE
+        WHEN limit_price IS NULL THEN NULL
+        ELSE CAST(ROUND(limit_price * 100) AS BIGINT)
+    END,
+    average_fill_price_cents = CASE
+        WHEN average_fill_price IS NULL THEN NULL
+        ELSE CAST(ROUND(average_fill_price * 100) AS BIGINT)
+    END,
+    reserved_cash_cents = CAST(ROUND(reserved_cash * 100) AS BIGINT);
+UPDATE paper_fills
+SET price_cents = CAST(ROUND(price * 100) AS BIGINT),
+    fees_cents = CAST(ROUND(fees * 100) AS BIGINT);
+UPDATE account_daily_snapshots
+SET start_equity_cents = CAST(ROUND(start_equity * 100) AS BIGINT),
+    current_equity_cents = CAST(ROUND(current_equity * 100) AS BIGINT),
+    daily_pnl_cents = CAST(ROUND(daily_pnl * 100) AS BIGINT);
+
+UPDATE live_orders
+SET limit_price_cents = CASE
+        WHEN limit_price IS NULL THEN NULL
+        ELSE CAST(ROUND(limit_price * 100) AS BIGINT)
+    END,
+    average_fill_price_cents = CASE
+        WHEN average_fill_price IS NULL THEN NULL
+        ELSE CAST(ROUND(average_fill_price * 100) AS BIGINT)
+    END;
+UPDATE live_trades
+SET price_cents = CAST(ROUND(price * 100) AS BIGINT),
+    fees_cents = CAST(ROUND(fees * 100) AS BIGINT);
+UPDATE live_account_state
+SET cash_cents = CAST(ROUND(cash * 100) AS BIGINT),
+    initial_cash_cents = CAST(ROUND(initial_cash * 100) AS BIGINT);
+UPDATE live_account_daily_snapshots
+SET start_equity_cents = CAST(ROUND(start_equity * 100) AS BIGINT),
+    current_equity_cents = CAST(ROUND(current_equity * 100) AS BIGINT),
+    daily_pnl_cents = CAST(ROUND(daily_pnl * 100) AS BIGINT);
+UPDATE live_positions SET average_cost_cents = CAST(ROUND(average_cost * 100) AS BIGINT);
+UPDATE reconciliations SET cash_diff_cents = CAST(ROUND(cash_diff * 100) AS BIGINT);
+
+UPDATE mock_broker_orders
+SET limit_price_cents = CASE
+        WHEN limit_price IS NULL THEN NULL
+        ELSE CAST(ROUND(limit_price * 100) AS BIGINT)
+    END,
+    average_fill_price_cents = CASE
+        WHEN average_fill_price IS NULL THEN NULL
+        ELSE CAST(ROUND(average_fill_price * 100) AS BIGINT)
+    END;
+UPDATE mock_broker_trades SET price_cents = CAST(ROUND(price * 100) AS BIGINT);
+UPDATE mock_broker_accounts
+SET cash_cents = CAST(ROUND(cash * 100) AS BIGINT),
+    initial_cash_cents = CAST(ROUND(initial_cash * 100) AS BIGINT);
+UPDATE mock_broker_positions SET average_cost_cents = CAST(ROUND(average_cost * 100) AS BIGINT);
+"""
+
 MIGRATIONS = (
     (1, SCHEMA),
     (2, TASK_SCHEMA),
+    (3, FACTOR_CACHE_AND_MONEY_SCHEMA),
 )
 
 
@@ -697,10 +807,12 @@ class PostgresConnection:
         return self._connection.execute(converted, tuple(params))
 
     def executemany(self, sql: str, params: Iterable[Sequence[Any]]):
-        return self._connection.executemany(
+        cursor = self._connection.cursor()
+        cursor.executemany(
             _qmark_to_postgres(sql),
-            params,
+            [tuple(item) for item in params],
         )
+        return cursor
 
     def executescript(self, script: str) -> None:
         for statement in _postgres_script(script).split(";"):

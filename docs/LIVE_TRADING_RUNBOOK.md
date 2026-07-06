@@ -9,7 +9,7 @@
 1. 在服务商后台撤销旧授权码并生成新码。
 2. 只把新码写入本机 `.env` 或部署密钥系统。
 3. 确认 `.env` 被 `.gitignore` 排除。
-4. 生成独立管理员密钥：
+4. 生成独立只读密钥、管理员密钥和两把操作员密钥：
 
 ```bash
 openssl rand -hex 32
@@ -53,6 +53,7 @@ QUANTDEV_REQUIRE_ORDER_APPROVAL=true
 QUANTDEV_APPROVAL_TTL_SECONDS=300
 QUANTDEV_MAX_LIVE_ORDER_NOTIONAL=5000
 QUANTDEV_MAX_DAILY_LOSS=1000
+QUANTDEV_READ_API_KEY=上一步生成的只读随机值
 QUANTDEV_PAPER_ENFORCE_SESSION=true
 QUANTDEV_PAPER_QUOTE_MODE=realtime
 QUANTDEV_QUOTE_MAX_AGE_SECONDS=15
@@ -63,6 +64,8 @@ QUANTDEV_RUNNER_POLL_SECONDS=5
 QUANTDEV_RUNNER_LEASE_SECONDS=60
 QUANTDEV_RECONCILIATION_MAX_AGE_MINUTES=1440
 QUANTDEV_ADMIN_API_KEY=上一步生成的随机值
+QUANTDEV_OPERATOR_KEYS=alice:操作员A随机值,bob:操作员B随机值
+QUANTDEV_BROKER_DRY_RUN=true
 ```
 
 迁移并启动：
@@ -103,7 +106,7 @@ Content-Type: application/json
 ## 4. 创建并手动验证策略
 
 1. 打开“策略运行”。
-2. 保存管理员密钥。
+2. 保存只读密钥和管理员/操作员密钥。
 3. 创建策略时保持“停用”。
 4. 单票目标金额先设为 1,000 至 5,000 元。
 5. 点击“运行”，检查目标、订单意图、订单和持仓。
@@ -202,11 +205,27 @@ QUANTDEV_BROKER_ADAPTER=your_package.qmt:create_broker
 QUANTDEV_BROKER_MODE=live
 QUANTDEV_BROKER_ADAPTER=your_package.qmt:create_broker
 QUANTDEV_LIVE_TRADING_ENABLED=true
+QUANTDEV_BROKER_DRY_RUN=true
 QUANTDEV_REQUIRE_ORDER_APPROVAL=true
 QUANTDEV_APPROVAL_TTL_SECONDS=300
 QUANTDEV_MAX_LIVE_ORDER_NOTIONAL=1000
 QUANTDEV_MAX_DAILY_LOSS=200
 ```
+
+先启动 dry-run live runner：
+
+```bash
+make live-runner
+```
+
+Docker：
+
+```bash
+docker compose -f compose.prod.yml --profile live up -d live-runner
+```
+
+dry-run 阶段只验证真实账户查询、策略意图、审批、对账和告警；报单/撤单不会发往真实柜台。
+`/api/live/readiness` 会在 `QUANTDEV_BROKER_DRY_RUN=true` 时阻断真实下单就绪阶段。
 
 操作规则：
 
@@ -230,8 +249,12 @@ POST /api/live/sync
 POST /api/live/reconcile
 ```
 
-所有写操作都必须携带 `X-Admin-Key`。前端还会发送 `X-Operator` 用于审批审计。审批
-后若数量、方向、价格等请求内容发生变化，原审批哈希自动失效，必须重新审批。
+所有写操作都必须携带 `X-Admin-Key` 或操作员密钥。配置 `QUANTDEV_OPERATOR_KEYS` 后，
+审批人与提交人身份由密钥反查绑定，前端自报的 `X-Operator` 不再作为可信身份来源。
+审批后若数量、方向、价格等请求内容发生变化，原审批哈希自动失效，必须重新审批。
+
+dry-run 稳定后，且 readiness 除 dry-run 项外全部通过，再把
+`QUANTDEV_BROKER_DRY_RUN=false`，重启 `app` 与 `live-runner`，进入半自动真实下单。
 
 至少稳定运行 20 个交易日，再评估是否进入自动审批。
 

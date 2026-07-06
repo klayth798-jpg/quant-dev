@@ -6,8 +6,8 @@
 Internet -> Caddy(80/443) -> FastAPI
                             -> PostgreSQL
 FastAPI -> Redis -> Worker  -> PostgreSQL
-Paper Runner               -> PostgreSQL
-Backup Service             -> PostgreSQL dump
+Paper Runner / Live Runner  -> PostgreSQL
+Backup Service              -> PostgreSQL dump
 ```
 
 PostgreSQL 和 Redis 只在 Docker 内网开放，不映射服务器端口。
@@ -45,9 +45,16 @@ openssl rand -hex 32
 openssl rand -hex 32
 ```
 
-分别填入 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 和
-`QUANTDEV_ADMIN_API_KEY`。密码建议只用字母数字，避免 DSN 转义问题。再填写域名和
-Tinyshare/Tushare Token。初次部署保持：
+分别填入 `POSTGRES_PASSWORD`、`REDIS_PASSWORD`、`QUANTDEV_READ_API_KEY` 和
+`QUANTDEV_ADMIN_API_KEY`。密码建议只用字母数字，避免 DSN 转义问题。
+真实资金前再配置：
+
+```dotenv
+QUANTDEV_OPERATOR_KEYS=alice:<alice-key>,bob:<bob-key>
+QUANTDEV_BROKER_DRY_RUN=true
+```
+
+再填写域名和 Tinyshare/Tushare Token。初次部署保持：
 
 ```dotenv
 QUANTDEV_BROKER_MODE=disabled
@@ -127,7 +134,14 @@ docker compose --env-file .env.production -f compose.prod.yml \
   --profile paper-live up -d paper-runner
 ```
 
-真实券商接入前不要开启 `live`。
+接入真实券商的只读/dry-run 演练运行器：
+
+```bash
+docker compose --env-file .env.production -f compose.prod.yml \
+  --profile live up -d live-runner
+```
+
+关闭 `QUANTDEV_BROKER_DRY_RUN` 前不要把它称为真实下单运行。
 
 ## 6. 备份与恢复
 
@@ -147,8 +161,9 @@ container_id="$(docker compose --env-file .env.production \
 docker cp "$container_id:/backups/." ./offsite-backups/
 ```
 
-恢复前先停止 `app`、`worker` 和 `paper-runner`，在新空库执行 `pg_restore`，然后重新
-运行迁移和健康检查。至少每月做一次恢复演练；只有实际恢复成功的备份才算可用备份。
+恢复前先停止 `app`、`worker`、`paper-runner` 和 `live-runner`，在新空库执行
+`pg_restore`，然后重新运行迁移和健康检查。至少每月做一次恢复演练；只有实际恢复成功
+的备份才算可用备份。
 
 ## 7. 上线检查
 

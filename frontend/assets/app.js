@@ -15,11 +15,23 @@ const state = {
   strategyRuns: [],
   activeStrategyRun: null,
   activeBacktest: null,
+  explorer: {
+    tab: "prices",
+    symbol: "600519.SH",
+    prices: null,
+    financials: null,
+    factorId: "",
+    factorScores: null,
+    screenIndustry: "",
+    screenKeyword: "",
+    screenSort: "symbol",
+  },
 };
 
 const viewMeta = {
   overview: ["WORKSPACE / OVERVIEW", "量化研究总览"],
   data: ["RESEARCH / DATA", "数据中心"],
+  explorer: ["RESEARCH / EXPLORER", "数据浏览"],
   factors: ["RESEARCH / FACTORS", "因子实验室"],
   backtest: ["RESEARCH / BACKTEST", "策略回测"],
   risk: ["PORTFOLIO / RISK", "风险检查"],
@@ -63,10 +75,12 @@ function showToast(message, type = "info") {
 
 async function api(path, options = {}) {
   const adminKey = window.localStorage.getItem("quantdevAdminKey") || "";
+  const readKey = window.localStorage.getItem("quantdevReadKey") || "";
   const operator = window.localStorage.getItem("quantdevOperator") || "local-admin";
   const response = await fetch(path, {
     headers: {
       "Content-Type": "application/json",
+      ...(readKey ? { "X-Read-Key": readKey } : {}),
       ...(adminKey ? { "X-Admin-Key": adminKey } : {}),
       "X-Operator": operator,
       ...(options.headers || {}),
@@ -949,6 +963,8 @@ function renderStrategy() {
   const guard = state.liveGuard;
   const clock = state.marketClock;
   const keyConfigured = Boolean(window.localStorage.getItem("quantdevAdminKey"));
+  const readKeyConfigured = Boolean(window.localStorage.getItem("quantdevReadKey"));
+  const operator = window.localStorage.getItem("quantdevOperator") || "local-admin";
   workspace.innerHTML = `
     <div class="metric-grid">
       ${metric("交易时钟", clock.can_trade ? "可交易" : "关闭", clock.session, clock.can_trade ? "positive" : "negative")}
@@ -972,10 +988,12 @@ function renderStrategy() {
         </form>
       </section>
       <aside class="panel">
-        <div class="panel-header"><div><h2>操作认证</h2><p>写操作使用 X-Admin-Key</p></div></div>
-        <div class="field"><label for="admin-key">管理员密钥</label><input id="admin-key" type="password" value="" placeholder="${keyConfigured ? "已保存在本机浏览器" : "未配置"}" /></div>
+        <div class="panel-header"><div><h2>操作认证</h2><p>只读、管理、操作员身份分离</p></div></div>
+        <div class="field"><label for="read-key">只读密钥</label><input id="read-key" type="password" value="" placeholder="${readKeyConfigured ? "已保存在本机浏览器" : "未配置"}" /></div>
+        <div class="field"><label for="admin-key">管理员/操作员密钥</label><input id="admin-key" type="password" value="" placeholder="${keyConfigured ? "已保存在本机浏览器" : "未配置"}" /></div>
+        <div class="field"><label for="operator-name">操作员名</label><input id="operator-name" value="${escapeHtml(operator)}" /></div>
         <div class="form-actions">
-          <button class="button secondary" id="save-admin-key" type="button">保存密钥</button>
+          <button class="button secondary" id="save-admin-key" type="button">保存认证</button>
           <button class="button ${guard.kill_switch.active ? "" : "danger"}" id="toggle-kill" type="button">${guard.kill_switch.active ? "解除熔断" : "立即熔断"}</button>
         </div>
       </aside>
@@ -1066,7 +1084,7 @@ function intentActions(item) {
   if (item.approval_status === "APPROVED" && ["PENDING_APPROVAL", "APPROVED", "BLOCKED"].includes(item.status)) {
     actions.push(`<button class="button" data-submit-intent="${escapeHtml(item.intent_id)}">提交</button>`);
   }
-  if (!["FILLED", "CANCELLED", "REJECTED"].includes(item.status)) {
+  if (!["FILLED", "CANCELLED", "REJECTED", "DRY_RUN"].includes(item.status)) {
     actions.push(`<button class="button danger" data-reject-intent="${escapeHtml(item.intent_id)}">拒绝</button>`);
   }
   if (item.live_order_id && ["OPEN", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN"].includes(item.status)) {
@@ -1178,10 +1196,15 @@ async function refreshStrategyData() {
 }
 
 function saveAdminKey() {
-  const value = document.querySelector("#admin-key").value.trim();
-  if (value) window.localStorage.setItem("quantdevAdminKey", value);
+  const readValue = document.querySelector("#read-key").value.trim();
+  const adminValue = document.querySelector("#admin-key").value.trim();
+  const operator = document.querySelector("#operator-name").value.trim() || "local-admin";
+  if (readValue) window.localStorage.setItem("quantdevReadKey", readValue);
+  else window.localStorage.removeItem("quantdevReadKey");
+  if (adminValue) window.localStorage.setItem("quantdevAdminKey", adminValue);
   else window.localStorage.removeItem("quantdevAdminKey");
-  showToast(value ? "管理员密钥已保存在本机浏览器" : "管理员密钥已清除");
+  window.localStorage.setItem("quantdevOperator", operator);
+  showToast("认证信息已保存在本机浏览器");
   renderStrategy();
 }
 
@@ -1317,6 +1340,300 @@ async function runAgent(event) {
   }
 }
 
+const EXPLORER_TABS = [
+  ["prices", "个股行情"],
+  ["financials", "财务指标"],
+  ["factor", "因子打分榜"],
+  ["screener", "市场筛选"],
+];
+
+function fmtCell(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "number") return number(value);
+  return String(value);
+}
+
+function renderExplorer() {
+  const ex = state.explorer;
+  const tabBar = EXPLORER_TABS.map(
+    ([key, label]) =>
+      `<button class="button ${ex.tab === key ? "" : "secondary"}" data-ex-tab="${key}">${label}</button>`,
+  ).join(" ");
+  let body = "";
+  if (ex.tab === "prices") body = explorerPricesTab(ex);
+  else if (ex.tab === "financials") body = explorerFinancialsTab(ex);
+  else if (ex.tab === "factor") body = explorerFactorTab(ex);
+  else body = explorerScreenerTab(ex);
+  workspace.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tabBar}</div>
+    ${body}`;
+  wireExplorer(ex);
+}
+
+function explorerPricesTab(ex) {
+  const p = ex.prices;
+  let detail = `<div class="empty-state compact">输入股票代码后点击查询</div>`;
+  if (p && p.items && p.items.length) {
+    const rows = p.items
+      .slice()
+      .reverse()
+      .map(
+        (r) => `<tr>
+          <td class="mono">${escapeHtml(r.trade_date)}</td>
+          <td>${number(r.open)}</td><td>${number(r.high)}</td>
+          <td>${number(r.low)}</td><td><strong>${number(r.close)}</strong></td>
+          <td>${Number(r.volume || 0).toLocaleString("zh-CN")}</td>
+        </tr>`,
+      )
+      .join("");
+    detail = `
+      <div class="panel-header" style="margin-top:8px"><div><h2 style="font-size:16px">${escapeHtml(p.symbol)} 价格走势（前复权）</h2></div></div>
+      <div class="chart-wrap"><canvas id="explorer-price-chart"></canvas></div>
+      <div class="table-shell"><table>
+        <thead><tr><th>交易日</th><th>开</th><th>高</th><th>低</th><th>收</th><th>成交量</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+  }
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>个股行情</h2><p>输入股票代码查看历史价格与走势</p></div></div>
+    <div class="form-grid">
+      <div class="field span-2"><label for="ex-symbol">股票代码</label>
+        <input id="ex-symbol" value="${escapeHtml(ex.symbol)}" placeholder="如 600519.SH / 000001.SZ" /></div>
+      <div class="form-actions" style="align-self:end"><button class="button" id="ex-price-query">查询</button></div>
+    </div>
+    ${detail}
+  </section>`;
+}
+
+function explorerFinancialsTab(ex) {
+  const f = ex.financials;
+  let table = `<div class="empty-state compact">输入股票代码后点击查询</div>`;
+  if (f) {
+    if (!f.items || !f.items.length) {
+      table = `<div class="empty-state compact">该标的暂无财务数据</div>`;
+    } else {
+      const cols = Object.keys(f.items[0]);
+      table = `<div class="table-shell"><table>
+        <thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>
+        <tbody>${f.items
+          .map(
+            (row) =>
+              `<tr>${cols.map((c) => `<td class="mono">${escapeHtml(fmtCell(row[c]))}</td>`).join("")}</tr>`,
+          )
+          .join("")}</tbody></table></div>`;
+    }
+  }
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>财务指标</h2><p>输入股票代码查看财务指标历史（左右可滚动）</p></div></div>
+    <div class="form-grid">
+      <div class="field span-2"><label for="ex-fin-symbol">股票代码</label>
+        <input id="ex-fin-symbol" value="${escapeHtml(ex.symbol)}" placeholder="如 600519.SH" /></div>
+      <div class="form-actions" style="align-self:end"><button class="button" id="ex-fin-query">查询</button></div>
+    </div>
+    ${table}
+  </section>`;
+}
+
+function explorerFactorTab(ex) {
+  const options = state.factors
+    .map(
+      (item) =>
+        `<option value="${escapeHtml(item.factor_id)}" ${ex.factorId === item.factor_id ? "selected" : ""}>${escapeHtml(item.name || item.factor_id)}</option>`,
+    )
+    .join("");
+  const s = ex.factorScores;
+  const board = (items, title) => `<section class="panel">
+    <div class="panel-header"><div><h2 style="font-size:16px">${title}</h2></div></div>
+    <div class="table-shell"><table>
+      <thead><tr><th>#</th><th>代码</th><th>名称</th><th>行业</th><th>因子值</th></tr></thead>
+      <tbody>${items
+        .map(
+          (it, i) =>
+            `<tr><td>${i + 1}</td><td class="mono">${escapeHtml(it.symbol)}</td><td>${escapeHtml(it.name)}</td><td>${escapeHtml(it.industry)}</td><td><strong>${number(it.score, 4)}</strong></td></tr>`,
+        )
+        .join("")}</tbody></table></div></section>`;
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>因子打分榜</h2><p>读取最新缓存；缓存缺失时使用管理员权限创建后台刷新任务</p></div></div>
+    <div class="form-grid">
+      <div class="field span-2"><label for="ex-factor">因子</label><select id="ex-factor">${options}</select></div>
+      <div class="form-actions" style="align-self:end"><button class="button" id="ex-factor-query">查询</button></div>
+    </div>
+  </section>
+  ${
+    s
+      ? `<div class="subtle" style="margin:4px 0 12px">信号日 ${escapeHtml(s.signal_date || "")} · 全市场 ${s.count} 只</div>
+         ${board(s.top, "📈 得分最高 Top")} ${board(s.bottom, "📉 得分最低 Bottom")}`
+      : `<div class="empty-state compact">选择因子后点击查询缓存</div>`
+  }`;
+}
+
+function explorerScreenerTab(ex) {
+  const industries = Array.from(
+    new Set(state.instruments.map((i) => i.industry).filter(Boolean)),
+  ).sort();
+  let list = state.instruments.slice();
+  if (ex.screenIndustry) list = list.filter((i) => i.industry === ex.screenIndustry);
+  if (ex.screenKeyword.trim()) {
+    const kw = ex.screenKeyword.trim();
+    list = list.filter((i) => `${i.symbol}${i.name || ""}`.includes(kw));
+  }
+  if (ex.screenSort === "name")
+    list.sort((a, b) => (a.name || "").localeCompare(b.name || "", "zh"));
+  else if (ex.screenSort === "industry")
+    list.sort((a, b) => (a.industry || "").localeCompare(b.industry || "", "zh"));
+  else list.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  const shown = list.slice(0, 200);
+  const opts =
+    `<option value="">全部行业</option>` +
+    industries
+      .map(
+        (i) =>
+          `<option value="${escapeHtml(i)}" ${ex.screenIndustry === i ? "selected" : ""}>${escapeHtml(i)}</option>`,
+      )
+      .join("");
+  return `<section class="panel">
+    <div class="panel-header"><div><h2>市场筛选</h2><p>共 ${state.instruments.length} 只，按筛选后展示前 ${shown.length}（关键词输入后按回车）</p></div></div>
+    <div class="form-grid">
+      <div class="field"><label for="ex-screen-industry">行业</label><select id="ex-screen-industry">${opts}</select></div>
+      <div class="field"><label for="ex-screen-kw">代码/名称关键词</label><input id="ex-screen-kw" value="${escapeHtml(ex.screenKeyword)}" placeholder="如 银行 / 600" /></div>
+      <div class="field"><label for="ex-screen-sort">排序</label><select id="ex-screen-sort">
+        <option value="symbol" ${ex.screenSort === "symbol" ? "selected" : ""}>按代码</option>
+        <option value="name" ${ex.screenSort === "name" ? "selected" : ""}>按名称</option>
+        <option value="industry" ${ex.screenSort === "industry" ? "selected" : ""}>按行业</option>
+      </select></div>
+    </div>
+    <div class="table-shell"><table>
+      <thead><tr><th>代码</th><th>名称</th><th>交易所</th><th>行业</th><th></th></tr></thead>
+      <tbody>${shown
+        .map(
+          (i) => `<tr>
+          <td class="mono">${escapeHtml(i.symbol)}</td><td>${escapeHtml(i.name)}</td>
+          <td>${escapeHtml(i.exchange)}</td><td>${escapeHtml(i.industry)}</td>
+          <td><button class="button secondary" data-ex-view-symbol="${escapeHtml(i.symbol)}">看行情</button></td>
+        </tr>`,
+        )
+        .join("")}</tbody></table></div>
+  </section>`;
+}
+
+function wireExplorer(ex) {
+  document.querySelectorAll("[data-ex-tab]").forEach((b) =>
+    b.addEventListener("click", () => {
+      ex.tab = b.dataset.exTab;
+      renderExplorer();
+    }),
+  );
+  const bind = (id, event, fn) => {
+    const el = document.querySelector(id);
+    if (el) el.addEventListener(event, fn);
+  };
+  const onEnter = (id, fn) =>
+    bind(id, "keydown", (e) => {
+      if (e.key === "Enter") fn();
+    });
+  bind("#ex-price-query", "click", explorerQueryPrices);
+  onEnter("#ex-symbol", explorerQueryPrices);
+  bind("#ex-fin-query", "click", explorerQueryFinancials);
+  onEnter("#ex-fin-symbol", explorerQueryFinancials);
+  bind("#ex-factor-query", "click", explorerQueryFactor);
+  bind("#ex-screen-industry", "change", (e) => {
+    ex.screenIndustry = e.target.value;
+    renderExplorer();
+  });
+  bind("#ex-screen-sort", "change", (e) => {
+    ex.screenSort = e.target.value;
+    renderExplorer();
+  });
+  bind("#ex-screen-kw", "input", (e) => {
+    ex.screenKeyword = e.target.value;
+  });
+  onEnter("#ex-screen-kw", renderExplorer);
+  document.querySelectorAll("[data-ex-view-symbol]").forEach((b) =>
+    b.addEventListener("click", () => {
+      ex.symbol = b.dataset.exViewSymbol;
+      ex.tab = "prices";
+      explorerQueryPrices();
+    }),
+  );
+  if (ex.tab === "prices" && ex.prices && ex.prices.items && ex.prices.items.length) {
+    const canvas = document.querySelector("#explorer-price-chart");
+    if (canvas)
+      drawLineChart(
+        canvas,
+        ex.prices.items.map((r) => ({ date: r.trade_date, close: Number(r.close) })),
+        "close",
+      );
+  }
+}
+
+async function explorerQueryPrices() {
+  const ex = state.explorer;
+  const input = document.querySelector("#ex-symbol");
+  const symbol = (input ? input.value : ex.symbol).trim();
+  if (!symbol) return;
+  ex.symbol = symbol;
+  try {
+    ex.prices = await api(`/api/market/prices?symbol=${encodeURIComponent(symbol)}&limit=120`);
+    ex.tab = "prices";
+    renderExplorer();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function explorerQueryFinancials() {
+  const ex = state.explorer;
+  const input = document.querySelector("#ex-fin-symbol");
+  const symbol = (input ? input.value : ex.symbol).trim();
+  if (!symbol) return;
+  ex.symbol = symbol;
+  try {
+    ex.financials = await api(
+      `/api/data/financials/${encodeURIComponent(symbol)}?limit=20`,
+    );
+    renderExplorer();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function explorerQueryFactor() {
+  const ex = state.explorer;
+  const select = document.querySelector("#ex-factor");
+  const factorId = select ? select.value : ex.factorId;
+  if (!factorId) {
+    showToast("请选择一个因子", "error");
+    return;
+  }
+  ex.factorId = factorId;
+  showToast("正在读取因子分数缓存");
+  try {
+    ex.factorScores = await api(
+      `/api/factors/${encodeURIComponent(factorId)}/scores?limit=30`,
+    );
+    renderExplorer();
+  } catch (error) {
+    const adminKey = window.localStorage.getItem("quantdevAdminKey") || "";
+    if (!adminKey) {
+      showToast(error.message, "error");
+      return;
+    }
+    try {
+      const task = await api(
+        `/api/factors/${encodeURIComponent(factorId)}/scores/refresh`,
+        { method: "POST" },
+      );
+      await waitForTask(task.task_id, "因子分数缓存刷新中");
+      ex.factorScores = await api(
+        `/api/factors/${encodeURIComponent(factorId)}/scores?limit=30`,
+      );
+      renderExplorer();
+      showToast("因子分数缓存已刷新");
+    } catch (refreshError) {
+      showToast(refreshError.message, "error");
+    }
+  }
+}
+
 function render() {
   const [eyebrow, title] = viewMeta[state.view];
   document.querySelector("#page-eyebrow").textContent = eyebrow;
@@ -1328,6 +1645,7 @@ function render() {
   const renderers = {
     overview: renderOverview,
     data: renderData,
+    explorer: renderExplorer,
     factors: renderFactors,
     backtest: renderBacktest,
     risk: renderRisk,

@@ -74,6 +74,72 @@ class ResearchRepository:
             "created_at": created_at,
         }
 
+    def save_factor_score_snapshot(
+        self,
+        factor_id: str,
+        snapshot_id: str,
+        signal_date: str,
+        neutralize: bool,
+        scores: Dict[str, float],
+    ) -> Dict[str, Any]:
+        created_at = utc_now()
+        normalized = {symbol: float(value) for symbol, value in scores.items()}
+        with database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO factor_score_snapshots
+                    (factor_id, snapshot_id, signal_date, neutralize, scores_json,
+                     score_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(factor_id, snapshot_id, signal_date, neutralize)
+                DO UPDATE SET
+                    scores_json = excluded.scores_json,
+                    score_count = excluded.score_count,
+                    created_at = excluded.created_at
+                """,
+                (
+                    factor_id,
+                    snapshot_id,
+                    signal_date,
+                    int(neutralize),
+                    json.dumps(normalized, ensure_ascii=True),
+                    len(normalized),
+                    created_at,
+                ),
+            )
+        return {
+            "factor_id": factor_id,
+            "snapshot_id": snapshot_id,
+            "signal_date": signal_date,
+            "neutralize": bool(neutralize),
+            "scores": normalized,
+            "score_count": len(normalized),
+            "created_at": created_at,
+        }
+
+    def get_factor_score_snapshot(
+        self,
+        factor_id: str,
+        snapshot_id: str,
+        signal_date: str,
+        neutralize: bool,
+    ) -> Optional[Dict[str, Any]]:
+        with database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM factor_score_snapshots
+                WHERE factor_id = ? AND snapshot_id = ?
+                  AND signal_date = ? AND neutralize = ?
+                """,
+                (factor_id, snapshot_id, signal_date, int(neutralize)),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["neutralize"] = bool(item["neutralize"])
+        item["scores"] = decode_json(item.pop("scores_json"))
+        return item
+
     def save_backtest(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with database.transaction() as connection:
             connection.execute(
